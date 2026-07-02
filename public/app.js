@@ -3,6 +3,9 @@
 
   const API_PATH = '/api/fund-flow/overview';
   const REQUEST_INTERVAL_MS = 8000;
+  const REQUEST_TIMEOUT_MS = 6500;
+  const CLIENT_CACHE_KEY = 'a-share-fund-flow:last-overview:v2';
+  const CLIENT_CACHE_MAX_AGE_MS = 20 * 60 * 1000;
   const POINT_COUNT = 48;
   const TRADING_DAY_MINUTES = 240;
   const CATEGORY_LABELS = {
@@ -37,6 +40,8 @@
     lastFetchAt: 0,
     nextFetchAt: 0,
     fetching: false,
+    consecutiveErrors: 0,
+    cacheLoaded: false,
     visibleSeries: [],
     plot: null,
     scrubMinute: null,
@@ -155,32 +160,43 @@
   async function fetchData(force) {
     const now = Date.now();
     if (state.fetching) return;
+    if (!force && document.hidden) return;
     if (!force && state.paused) return;
     if (!force && now < state.nextFetchAt) return;
     state.fetching = true;
     updateRefreshButton();
     setStatus('loading', '请求中');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), force ? REQUEST_TIMEOUT_MS + 3500 : REQUEST_TIMEOUT_MS);
 
     try {
-      const res = await fetch(requestUrl(force), { cache: 'no-store' });
+      const res = await fetch(requestUrl(force), { cache: 'no-store', signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       applyData(data);
+      saveClientCache(data);
+      state.consecutiveErrors = 0;
       state.lastFetchAt = now;
       state.nextFetchAt = now + (data.refreshAfterMs || REQUEST_INTERVAL_MS);
     } catch (err) {
+      const message = err.name === 'AbortError' ? '请求超时，沿用上一帧' : (err.message || '请求失败');
       if (!state.data) {
-        applyData(createEmptyData(`真实数据暂不可用：${err.message || '无法连接代理'}`));
+        const cached = loadClientCache();
+        if (cached) applyData(markCachedData(cached.data, `服务器暂慢，先显示本机缓存：${message}`));
+        else applyData(createEmptyData(`真实数据暂不可用：${message}`));
       } else {
         state.data.sourceStatus = {
           level: 'warn',
           text: '沿用旧数据',
-          detail: err.message || '请求失败'
+          detail: message
         };
+        renderAll();
       }
-      state.nextFetchAt = now + REQUEST_INTERVAL_MS;
+      state.consecutiveErrors += 1;
+      state.nextFetchAt = now + retryDelayMs();
       updateStatus();
     } finally {
+      clearTimeout(timeout);
       state.fetching = false;
       updateRefreshButton();
     }
@@ -190,6 +206,51 @@
     state.data = normalizeClientData(data);
     state.hoverId = null;
     renderAll();
+  }
+
+  function loadCachedDataOnBoot() {
+    const cached = loadClientCache();
+    if (!cached) return false;
+    applyData(markCachedData(cached.data, '正在后台更新，先显示上次可用数据。'));
+    state.cacheLoaded = true;
+    return true;
+  }
+
+  function loadClientCache() {
+    try {
+      const raw = localStorage.getItem(CLIENT_CACHE_KEY);
+      if (!raw) return null;
+      const cached = JSON.parse(raw);
+      if (!cached?.data?.series?.length || Date.now() - Number(cached.savedAt || 0) > CLIENT_CACHE_MAX_AGE_MS) return null;
+      return cached;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveClientCache(data) {
+    if (!data?.series?.length) return;
+    try {
+      localStorage.setItem(CLIENT_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), data }));
+    } catch {
+      // Storage may be unavailable in private browsing.
+    }
+  }
+
+  function markCachedData(data, detail) {
+    return {
+      ...data,
+      sourceStatus: {
+        ...(data.sourceStatus || {}),
+        level: 'warn',
+        text: '缓存数据',
+        detail
+      }
+    };
+  }
+
+  function retryDelayMs() {
+    return Math.min(45000, REQUEST_INTERVAL_MS * Math.max(1, state.consecutiveErrors));
   }
 
   function normalizeClientData(data) {
@@ -1023,6 +1084,11 @@
   function tick() {
     const now = Date.now();
     els.clock.textContent = formatClock(new Date());
+    if (document.hidden) {
+      els.countdown.textContent = '隐';
+      els.hint.textContent = '页面在后台，已暂停自动请求；回到页面会立即更新。';
+      return;
+    }
     if (state.paused) {
       els.countdown.textContent = '停';
       els.hint.textContent = '已暂停自动请求，手动刷新仍可使用。';
@@ -1112,6 +1178,12 @@
       if (!event.target.closest('[data-id]')) return;
       state.hoverId = null;
       drawChart();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      state.nextFetchAt = 0;
+      fetchData(false);
+      tick();
     });
   }
 
@@ -1301,7 +1373,7 @@
   }
 
   bindEvents();
-  applyData(createEmptyData('正在连接本地真实资金流接口。'));
+  if (!loadCachedDataOnBoot()) applyData(createEmptyData('正在连接本地真实资金流接口。'));
   resizeCanvas();
   fetchData(true);
   setInterval(tick, 1000);
