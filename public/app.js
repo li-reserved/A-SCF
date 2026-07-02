@@ -108,6 +108,12 @@
     return metric === 'price' ? formatPct(value) : formatMoney(value).replace('亿', '');
   }
 
+  function formatCompactMetricValue(value, metric) {
+    const num = Number(value) || 0;
+    const sign = num > 0 ? '+' : '';
+    return metric === 'price' ? `${sign}${num.toFixed(1)}%` : `${sign}${Math.round(num)}`;
+  }
+
   function colorClass(value) {
     return Number(value) >= 0 ? 'positive' : 'negative';
   }
@@ -458,8 +464,8 @@
   function buildPlots(width, height, timeline) {
     const compact = isCompactViewport();
     const labelReserve = state.chartMode === 'price'
-      ? Math.min(compact ? 76 : 190, Math.max(compact ? 42 : 130, width * (compact ? 0.08 : 0.16)))
-      : Math.min(compact ? 82 : 170, Math.max(compact ? 48 : 118, width * (compact ? 0.1 : 0.14)));
+      ? Math.min(compact ? 108 : 190, Math.max(compact ? 82 : 130, width * (compact ? 0.22 : 0.16)))
+      : Math.min(compact ? 116 : 170, Math.max(compact ? 88 : 118, width * (compact ? 0.25 : 0.14)));
     const pad = compact
       ? { top: 30, right: labelReserve, bottom: 34, left: 42 }
       : { top: 40, right: labelReserve, bottom: 48, left: 76 };
@@ -686,7 +692,7 @@
         x: marker.x,
         targetY: marker.y,
         y: marker.y - height / 2,
-        width: compact ? Math.min(58, Math.max(24, labelText.length * 8 + 8)) : Math.min(132, Math.max(34, labelText.length * 7.2 + 4)),
+        width: compact ? Math.min(106, Math.max(50, labelText.length * 6.4 + 6)) : Math.min(132, Math.max(34, labelText.length * 7.2 + 4)),
         height
       };
     }).filter(Boolean);
@@ -716,8 +722,9 @@
   }
 
   function compactLabelText(item, metric, value = labelValueFor(item, metric)) {
-    const limit = window.matchMedia('(max-width: 390px)').matches ? 3 : 4;
-    return item.name.length > limit ? item.name.slice(0, limit) : item.name;
+    const limit = window.matchMedia('(max-width: 390px)').matches ? 2 : 3;
+    const name = item.name.length > limit ? item.name.slice(0, limit) : item.name;
+    return `${name} ${formatCompactMetricValue(value, metric)}`;
   }
 
   function inlineLabelText(item, metric, value = labelValueFor(item, metric)) {
