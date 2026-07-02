@@ -1,0 +1,12 @@
+{
+  "name": "a-share-fund-flow",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A股资金流向独立桌面网页",
+  "type": "module",
+  "scripts": {
+    "fund-flow": "node scripts/fund-flow-proxy.mjs",
+    "start": "node scripts/fund-flow-proxy.mjs",
+    "check": "node --check public/app.js && node --check scripts/fund-flow-proxy.mjs"
+  }
+}
