@@ -94,10 +94,6 @@ h1 {
   flex-wrap: nowrap;
 }
 
-.market-meta #refreshBtn {
-  display: none;
-}
-
 .meta-chip {
   min-width: auto;
   padding: 9px 12px;
@@ -156,6 +152,12 @@ h1 {
   border-color: #aab7c6;
   box-shadow: 0 8px 20px rgba(24, 32, 43, 0.08);
   transform: translateY(-1px);
+}
+
+.ghost-btn:disabled {
+  cursor: wait;
+  opacity: 0.62;
+  transform: none;
 }
 
 .dashboard-grid {
@@ -650,10 +652,17 @@ select {
 
   .meta-chip.status,
   .meta-chip:first-child,
-  .ghost-btn#refreshBtn,
   .chart-tools label,
   .ghost-btn#pauseBtn {
     display: none;
+  }
+
+  .ghost-btn#refreshBtn {
+    height: 30px;
+    padding: 0 9px;
+    border-radius: 7px;
+    font-size: 12px;
+    white-space: nowrap;
   }
 
   .meta-chip {
@@ -828,6 +837,10 @@ select {
     width: 100%;
     justify-content: space-between;
     margin-left: 0;
+  }
+
+  .ghost-btn#refreshBtn {
+    flex: 0 0 auto;
   }
 
   .meta-chip:nth-child(2),

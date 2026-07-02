@@ -2,7 +2,7 @@
   'use strict';
 
   const API_PATH = '/api/fund-flow/overview';
-  const REQUEST_INTERVAL_MS = 15000;
+  const REQUEST_INTERVAL_MS = 8000;
   const POINT_COUNT = 48;
   const TRADING_DAY_MINUTES = 240;
   const CATEGORY_LABELS = {
@@ -140,23 +140,29 @@
     return state.chartMode === 'price' ? 'price' : 'flow';
   }
 
-  function requestUrl() {
+  function requestUrl(force = false) {
     const params = new URLSearchParams({
       scope: state.selectedScope,
       limit: '60'
     });
+    if (force) {
+      params.set('force', '1');
+      params.set('t', String(Date.now()));
+    }
     return `${API_PATH}?${params.toString()}`;
   }
 
   async function fetchData(force) {
     const now = Date.now();
-    if (state.fetching || state.paused) return;
+    if (state.fetching) return;
+    if (!force && state.paused) return;
     if (!force && now < state.nextFetchAt) return;
     state.fetching = true;
+    updateRefreshButton();
     setStatus('loading', '请求中');
 
     try {
-      const res = await fetch(requestUrl(), { cache: 'no-store' });
+      const res = await fetch(requestUrl(force), { cache: 'no-store' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       applyData(data);
@@ -176,6 +182,7 @@
       updateStatus();
     } finally {
       state.fetching = false;
+      updateRefreshButton();
     }
   }
 
@@ -301,6 +308,13 @@
       ? `当前显示全部 ${visible.length} 条重点大类；真实资金分钟线 ${minuteCount}/${visible.length}，涨跌幅真实分时 ${priceTrendCount}/${visible.length}。`
       : '';
     els.notice.innerHTML = `<strong>数据说明</strong><p>${escapeHtml(`${detail}${minuteHint ? ` ${minuteHint}` : ''}`)}</p>`;
+    updateRefreshButton();
+  }
+
+  function updateRefreshButton() {
+    if (!els.refresh) return;
+    els.refresh.disabled = state.fetching;
+    els.refresh.textContent = state.fetching ? '更新中' : '更新数据';
   }
 
   function updateLists() {

@@ -13,9 +13,10 @@ const rootDir = resolve(__dirname, '..');
 const pageDir = join(rootDir, 'public');
 const port = Number(process.env.FUND_FLOW_PORT || process.env.PORT || 5177);
 const aktoolsBase = process.env.AKTOOLS_BASE_URL || 'http://127.0.0.1:8080';
-const refreshAfterMs = Number(process.env.FUND_FLOW_REFRESH_MS || 15000);
-const cacheTtlMs = Number(process.env.FUND_FLOW_CACHE_MS || 30000);
-const minuteCacheTtlMs = Number(process.env.FUND_FLOW_MINUTE_CACHE_MS || 60000);
+const refreshAfterMs = Number(process.env.FUND_FLOW_REFRESH_MS || 8000);
+const cacheTtlMs = Number(process.env.FUND_FLOW_CACHE_MS || 8000);
+const minuteCacheTtlMs = Number(process.env.FUND_FLOW_MINUTE_CACHE_MS || 15000);
+const prefetchIntervalMs = Number(process.env.FUND_FLOW_PREFETCH_MS || 12000);
 const minuteFetchLimit = Number(process.env.FUND_FLOW_KLINE_LIMIT || 72);
 const minuteFetchPerGroup = Number(process.env.FUND_FLOW_KLINE_PER_GROUP || 4);
 const priceFetchLimit = Number(process.env.FUND_FLOW_PRICE_LIMIT || 60);
@@ -146,6 +147,7 @@ function startFundFlowServer() {
     console.log('真实数据源: 东方财富公开资金流接口');
     console.log(`AKTools: ${aktoolsBase}`);
   });
+  startPrefetchLoop();
   return server;
 }
 
@@ -153,9 +155,10 @@ async function handleOverview(url, res) {
   const now = Date.now();
   const limit = clamp(Number(url.searchParams.get('limit') || 30), 10, 60);
   const scope = url.searchParams.get('scope') || 'all';
+  const force = url.searchParams.get('force') === '1';
   const cacheKey = scope === 'all' ? 'focus' : scope;
   const cached = memory.cachedByScope.get(cacheKey);
-  if (cached && now - cached.cachedAt < cacheTtlMs) {
+  if (!force && cached && now - cached.cachedAt < cacheTtlMs) {
     applyMinutePointsToSeries(cached.payload.series);
     const filtered = await prepareFilteredPayload(cached.payload, scope, limit, 0);
     sendJson(res, 200, filtered);
@@ -164,7 +167,7 @@ async function handleOverview(url, res) {
     return;
   }
 
-  const loadPromise = startOverviewLoad(cacheKey, limit, scope);
+  const loadPromise = startOverviewLoad(cacheKey, limit, scope, force);
   const loaded = await withTimeout(loadPromise, overviewFetchTimeoutMs).catch(err => ({
     result: {
       series: [],
@@ -196,20 +199,22 @@ async function handleOverview(url, res) {
   }
 
   const payload = loaded.payload;
-  sendJson(res, 200, await prepareFilteredPayload(payload, scope, limit, responseHydrateWaitMs));
-  if (scope === 'all' || scope === 'industry' || scope === 'concept') scheduleMinuteHydration(payload.series);
-  if (scope === 'all' || scope === 'industry' || scope === 'concept') schedulePriceHydration(payload.series);
+  sendJson(res, 200, await prepareFilteredPayload(payload, scope, limit, force ? responseHydrateWaitMs * 2 : responseHydrateWaitMs, force));
+  if (scope === 'all' || scope === 'industry' || scope === 'concept') scheduleMinuteHydration(payload.series, force);
+  if (scope === 'all' || scope === 'industry' || scope === 'concept') schedulePriceHydration(payload.series, force);
 }
 
-function startOverviewLoad(cacheKey, limit, scope) {
+function startOverviewLoad(cacheKey, limit, scope, force = false) {
   const current = memory.loadingByScope.get(cacheKey);
-  if (current) return current;
+  if (!force && current) return current;
   const promise = loadRealData(limit, scope)
     .then(result => {
       if (!result.series.length) return { result, payload: null };
       const payload = normalizePayload(result.series, result.status);
-      applyMinutePointsToSeries(payload.series);
-      applyPricePointsToSeries(payload.series);
+      if (!force) {
+        applyMinutePointsToSeries(payload.series);
+        applyPricePointsToSeries(payload.series);
+      }
       memory.cachedByScope.set(cacheKey, { payload, cachedAt: Date.now() });
       return { result, payload };
     })
@@ -225,9 +230,9 @@ function startOverviewLoad(cacheKey, limit, scope) {
       payload: null
     }))
     .finally(() => {
-      memory.loadingByScope.delete(cacheKey);
+      if (!force) memory.loadingByScope.delete(cacheKey);
     });
-  memory.loadingByScope.set(cacheKey, promise);
+  if (!force) memory.loadingByScope.set(cacheKey, promise);
   return promise;
 }
 
@@ -549,12 +554,27 @@ function eastmoneyRowToSeries(row, category, sourceName, index) {
   };
 }
 
-function scheduleMinuteHydration(series) {
+function startPrefetchLoop() {
+  if (!prefetchIntervalMs || prefetchIntervalMs < 5000) return;
+  setInterval(() => {
+    const timeline = tradingTimeline();
+    if (!timeline.isTradingTime) return;
+    startOverviewLoad('focus', 60, 'all', true)
+      .then(({ payload }) => {
+        if (!payload?.series?.length) return;
+        scheduleMinuteHydration(payload.series, true);
+        schedulePriceHydration(payload.series, true);
+      })
+      .catch(() => {});
+  }, prefetchIntervalMs).unref?.();
+}
+
+function scheduleMinuteHydration(series, force = false) {
   if (memory.minuteHydrating) return;
   memory.minuteHydrating = true;
   setTimeout(async () => {
     try {
-      await hydrateMinutePoints(series);
+      await hydrateMinutePoints(series, force);
       memory.cachedByScope.forEach(entry => applyMinutePointsToSeries(entry.payload.series));
     } finally {
       memory.minuteHydrating = false;
@@ -562,12 +582,12 @@ function scheduleMinuteHydration(series) {
   }, 0);
 }
 
-function schedulePriceHydration(series) {
+function schedulePriceHydration(series, force = false) {
   if (memory.priceHydrating) return;
   memory.priceHydrating = true;
   setTimeout(async () => {
     try {
-      await hydratePricePoints(series);
+      await hydratePricePoints(series, force);
       memory.cachedByScope.forEach(entry => applyPricePointsToSeries(entry.payload.series));
     } finally {
       memory.priceHydrating = false;
@@ -575,7 +595,7 @@ function schedulePriceHydration(series) {
   }, 0);
 }
 
-async function hydrateMinutePoints(series) {
+async function hydrateMinutePoints(series, force = false) {
   const focusCandidates = selectMinuteCandidates(series);
   const focusIds = new Set(focusCandidates.map(item => item.id));
   const extraCount = Math.max(0, minuteFetchLimit - focusCandidates.length);
@@ -588,7 +608,7 @@ async function hydrateMinutePoints(series) {
   for (const batch of batches) {
     await Promise.all(batch.map(async item => {
       try {
-        const points = await emFundFlowMinutePoints(item);
+        const points = await emFundFlowMinutePoints(item, force);
         if (points.length) {
           item.points = points;
           item.pointSource = 'minute';
@@ -612,13 +632,13 @@ function applyMinutePointsToSeries(series) {
   });
 }
 
-async function hydratePricePoints(series) {
+async function hydratePricePoints(series, force = false) {
   const candidates = selectPriceCandidates(series);
   const batches = chunk(candidates, 6);
   for (const batch of batches) {
     await Promise.all(batch.map(async item => {
       try {
-        const points = await emPriceTrendPoints(item);
+        const points = await emPriceTrendPoints(item, force);
         if (points.length) {
           item.pricePoints = points;
           item.pricePointSource = points.length > 10 ? 'minute' : 'fallback';
@@ -673,11 +693,11 @@ function selectMinuteCandidates(series) {
     .slice(0, minuteFetchLimit);
 }
 
-async function emFundFlowMinutePoints(item) {
+async function emFundFlowMinutePoints(item, force = false) {
   const cacheKey = `${item.market}.${item.code}`;
   const cached = memory.minuteCached.get(cacheKey);
   const now = Date.now();
-  if (cached && now - cached.cachedAt < minuteCacheTtlMs) return cached.points;
+  if (!force && cached && now - cached.cachedAt < minuteCacheTtlMs) return cached.points;
   const params = {
     secid: `${item.market}.${item.code}`,
     klt: '1',
@@ -752,11 +772,11 @@ async function emFundFlowMinuteJson(path, params, host) {
   }
 }
 
-async function emPriceTrendPoints(item) {
+async function emPriceTrendPoints(item, force = false) {
   const cacheKey = `${item.market}.${item.code}`;
   const cached = memory.priceCached.get(cacheKey);
   const now = Date.now();
-  if (cached && now - cached.cachedAt < minuteCacheTtlMs) return cached.points;
+  if (!force && cached && now - cached.cachedAt < minuteCacheTtlMs) return cached.points;
   const params = {
     secid: `${item.market}.${item.code}`,
     fields1: 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13',
@@ -1057,24 +1077,24 @@ function filterPayload(payload, scope, limit) {
   };
 }
 
-async function prepareFilteredPayload(payload, scope, limit, waitMs) {
+async function prepareFilteredPayload(payload, scope, limit, waitMs, force = false) {
   const filtered = filterPayload(payload, scope, limit);
   if (scope === 'all' || scope === 'industry' || scope === 'concept') {
     const minuteWaitMs = Math.max(700, Math.floor(waitMs * 0.42));
     const priceWaitMs = Math.max(700, waitMs - minuteWaitMs);
-    await hydrateVisibleMinutePoints(filtered.series, minuteWaitMs);
+    await hydrateVisibleMinutePoints(filtered.series, minuteWaitMs, force);
     applyMinutePointsToSeries(filtered.series);
-    await hydrateVisiblePricePoints(filtered.series, priceWaitMs);
+    await hydrateVisiblePricePoints(filtered.series, priceWaitMs, force);
     applyPricePointsToSeries(filtered.series);
   }
   return filtered;
 }
 
-async function hydrateVisibleMinutePoints(series, waitMs = 2500) {
+async function hydrateVisibleMinutePoints(series, waitMs = 2500, force = false) {
   const missing = series
     .filter(item => item.sourceCode || item.code)
     .filter(item => item.category === 'focus' || item.category === 'industry' || item.category === 'concept')
-    .filter(item => item.pointSource !== 'minute' || !Array.isArray(item.points) || item.points.length <= 10)
+    .filter(item => force || item.pointSource !== 'minute' || !Array.isArray(item.points) || item.points.length <= 10)
     .slice(0, minuteFetchLimit)
     .map(item => ({
       ...item,
@@ -1092,16 +1112,16 @@ async function hydrateVisibleMinutePoints(series, waitMs = 2500) {
     if (Date.now() >= deadline) return;
     const leftMs = deadline - Date.now();
     await withTimeout(Promise.allSettled(batch.map(item => (
-      withTimeout(emFundFlowMinutePoints(item), Math.min(900, leftMs)).catch(() => null)
+      withTimeout(emFundFlowMinutePoints(item, force), Math.min(900, leftMs)).catch(() => null)
     ))), leftMs).catch(() => null);
   }
 }
 
-async function hydrateVisiblePricePoints(series, waitMs = 3000) {
+async function hydrateVisiblePricePoints(series, waitMs = 3000, force = false) {
   const missing = series
     .filter(item => item.sourceCode || item.code)
     .filter(item => item.category === 'focus' || item.category === 'industry' || item.category === 'concept')
-    .filter(item => !Array.isArray(item.pricePoints) || item.pricePoints.length <= 10)
+    .filter(item => force || !Array.isArray(item.pricePoints) || item.pricePoints.length <= 10)
     .slice(0, priceFetchLimit)
     .map(item => ({
       ...item,
@@ -1119,7 +1139,7 @@ async function hydrateVisiblePricePoints(series, waitMs = 3000) {
     if (Date.now() >= deadline) return;
     const leftMs = deadline - Date.now();
     await withTimeout(Promise.allSettled(batch.map(item => (
-      withTimeout(emPriceTrendPoints(item), Math.min(900, leftMs)).catch(() => null)
+      withTimeout(emPriceTrendPoints(item, force), Math.min(900, leftMs)).catch(() => null)
     ))), leftMs).catch(() => null);
   }
 }
