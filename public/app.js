@@ -497,10 +497,11 @@
     const base = metric === 'price' ? 1 : 10;
     const maxPositive = Math.max(base, ...values.filter(value => value > 0));
     const maxNegative = Math.max(base, ...values.filter(value => value < 0).map(value => Math.abs(value)));
+    const maxAbs = niceScale(Math.max(maxPositive, maxNegative), metric);
     return {
       metric,
-      positive: niceScale(maxPositive, metric),
-      negative: niceScale(maxNegative, metric)
+      positive: maxAbs,
+      negative: maxAbs
     };
   }
 
