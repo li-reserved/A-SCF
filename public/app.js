@@ -500,8 +500,9 @@
     const maxAbs = niceScale(Math.max(maxPositive, maxNegative), metric);
     return {
       metric,
-      positive: maxAbs,
-      negative: maxAbs
+      positive: niceScale(maxPositive, metric),
+      negative: niceScale(maxNegative, metric),
+      maxAbs
     };
   }
 
@@ -528,27 +529,21 @@
     ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
 
-    const steps = compact ? 4 : 5;
-    for (let i = 0; i <= steps; i += 1) {
-      const positiveValue = (scale.positive / steps) * i;
-      const negativeValue = -(scale.negative / steps) * i;
-      const rows = i === 0 ? [0] : [positiveValue, negativeValue];
-      rows.forEach(value => {
-        const y = yFor(value, plot, scale);
-        ctx.beginPath();
-        ctx.setLineDash(value === 0 ? [] : [5, 6]);
-        ctx.strokeStyle = value === 0 ? '#adb7c4' : '#e4e9ef';
-        ctx.moveTo(plot.x, y);
-        ctx.lineTo(plot.x + plot.width, y);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        ctx.fillStyle = value === 0 ? '#333b46' : '#606b78';
-        const label = plotInfo.metric === 'price'
-          ? `${value === 0 ? '0' : value.toFixed(value < 3 && value > -3 ? 1 : 0)}%`
-          : `${value === 0 ? '0' : Math.round(value)}亿`;
-        ctx.fillText(label, plot.x - (compact ? 6 : 12), y);
-      });
-    }
+    axisValueTicks(scale, compact).forEach(value => {
+      const y = yFor(value, plot, scale);
+      ctx.beginPath();
+      ctx.setLineDash(value === 0 ? [] : [5, 6]);
+      ctx.strokeStyle = value === 0 ? '#adb7c4' : '#e4e9ef';
+      ctx.moveTo(plot.x, y);
+      ctx.lineTo(plot.x + plot.width, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = value === 0 ? '#333b46' : '#606b78';
+      const label = plotInfo.metric === 'price'
+        ? `${value === 0 ? '0' : value.toFixed(Math.abs(value) < 3 ? 1 : 0)}%`
+        : `${value === 0 ? '0' : Math.round(value)}亿`;
+      ctx.fillText(label, plot.x - (compact ? 6 : 12), y);
+    });
 
     const endMinute = clamp(Number(plot.endMinute) || TRADING_DAY_MINUTES, 1, TRADING_DAY_MINUTES);
     const ticks = visibleTicks(endMinute, compact);
@@ -932,10 +927,24 @@
   }
 
   function yFor(value, plot, scale) {
-    const center = plot.y + plot.height / 2;
     const num = Number(value) || 0;
-    const scaleMax = num >= 0 ? scale.positive : scale.negative;
-    return center - (num / scaleMax) * (plot.height / 2);
+    const max = Number(scale.positive) || 1;
+    const min = -(Number(scale.negative) || 1);
+    const range = Math.max(1, max - min);
+    return plot.y + ((max - num) / range) * plot.height;
+  }
+
+  function axisValueTicks(scale, compact) {
+    const steps = compact ? 4 : 5;
+    const positive = Number(scale.positive) || 1;
+    const negative = Number(scale.negative) || 1;
+    const step = (Number(scale.maxAbs) || Math.max(positive, negative)) / steps;
+    const values = new Set([0, positive, -negative]);
+    for (let value = step; value < positive; value += step) values.add(round(value));
+    for (let value = step; value < negative; value += step) values.add(round(-value));
+    return [...values]
+      .filter(value => value <= positive && value >= -negative)
+      .sort((a, b) => b - a);
   }
 
   function lineColor(item, index, metric = activeMetric()) {
