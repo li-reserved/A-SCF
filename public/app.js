@@ -444,9 +444,17 @@
 
   function setScrubFromPointer(event) {
     if (!els.timeRange || !state.data) return;
+    setScrubMinuteFast(pointerMinute(event));
+  }
+
+  function pointerMinute(event) {
     const rect = els.timeRange.getBoundingClientRect();
     const pct = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-    setScrubMinuteFast(TRADING_DAY_MINUTES * pct);
+    return TRADING_DAY_MINUTES * pct;
+  }
+
+  function isFutureScrubPointer(event) {
+    return pointerMinute(event) > availableEndMinute() + 0.5;
   }
 
   function updateMobileStrip() {
@@ -1152,6 +1160,12 @@
       else setScrubMinute(els.timeRange.value);
     });
     els.timeRange?.addEventListener('pointerdown', event => {
+      if (isFutureScrubPointer(event)) {
+        event.preventDefault();
+        state.scrubMinute = null;
+        renderAll();
+        return;
+      }
       state.scrubDragging = true;
       els.timeRange.setPointerCapture?.(event.pointerId);
       setScrubFromPointer(event);
