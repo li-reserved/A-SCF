@@ -68,6 +68,8 @@
     sort: document.getElementById('sortMode'),
     tabs: document.getElementById('scopeTabs'),
     mode: document.getElementById('chartMode'),
+    timeTrack: document.getElementById('timeScrubTrack'),
+    timeScale: document.querySelector('.time-scrubber-scale'),
     timeRange: document.getElementById('timeScrubRange'),
     timeLabel: document.getElementById('timeScrubLabel'),
     timeNow: document.getElementById('timeNowBtn')
@@ -392,10 +394,32 @@
     if (!els.timeRange || !els.timeLabel || !state.data) return;
     const maxMinute = availableEndMinute();
     const selected = selectedMinute();
-    els.timeRange.max = String(maxMinute);
+    const scrubEndPct = clamp(maxMinute / TRADING_DAY_MINUTES, 0, 1);
+    els.timeRange.max = String(TRADING_DAY_MINUTES);
     els.timeRange.value = String(selected);
+    els.timeRange.disabled = maxMinute <= 0;
+    els.timeTrack?.style.setProperty('--scrub-end', `${scrubEndPct * 100}%`);
     els.timeLabel.textContent = `${state.scrubMinute === null ? '当前' : '回看'} ${minuteToTimeLabel(selected)}`;
     els.timeNow?.classList.toggle('active', state.scrubMinute === null);
+    updateScrubberScale(maxMinute);
+  }
+
+  function updateScrubberScale(maxMinute) {
+    const labels = els.timeScale?.querySelectorAll('span') || [];
+    if (labels.length < 3) return;
+    const end = clamp(maxMinute, 0, TRADING_DAY_MINUTES);
+    labels[0].textContent = '09:30';
+    labels[1].textContent = minuteToTimeLabel(Math.round(end / 2));
+    labels[2].textContent = minuteToTimeLabel(end);
+    const trackRect = els.timeTrack?.getBoundingClientRect();
+    const scaleRect = els.timeScale?.getBoundingClientRect();
+    if (!trackRect || !scaleRect) return;
+    const start = trackRect.left - scaleRect.left;
+    const endX = start + trackRect.width * (end / TRADING_DAY_MINUTES);
+    const midX = start + trackRect.width * ((end / 2) / TRADING_DAY_MINUTES);
+    labels[0].style.left = `${start}px`;
+    labels[1].style.left = `${midX}px`;
+    labels[2].style.left = `${endX}px`;
   }
 
   function setScrubMinute(minute) {
@@ -422,7 +446,7 @@
     if (!els.timeRange || !state.data) return;
     const rect = els.timeRange.getBoundingClientRect();
     const pct = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-    setScrubMinuteFast(availableEndMinute() * pct);
+    setScrubMinuteFast(TRADING_DAY_MINUTES * pct);
   }
 
   function updateMobileStrip() {
@@ -510,6 +534,7 @@
     els.canvas.width = Math.max(1, Math.floor(rect.width * ratio));
     els.canvas.height = Math.max(1, Math.floor(rect.height * ratio));
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    updateTimeScrubber();
     drawChart();
   }
 
@@ -1315,7 +1340,14 @@
   }
 
   function availableEndMinute() {
-    return clamp(Number(state.data?.timeline?.elapsed) || tradingTimeline().elapsed, 0, TRADING_DAY_MINUTES);
+    const dataElapsed = Number(state.data?.timeline?.elapsed);
+    const localTimeline = tradingTimeline();
+    const localElapsed = localTimeline.elapsed;
+    const candidate = Number.isFinite(dataElapsed) ? dataElapsed : localElapsed;
+    const today = formatDate(new Date());
+    const sameTradeDate = !state.data?.tradeDate || state.data.tradeDate === today;
+    const bounded = sameTradeDate && localElapsed < candidate ? localElapsed : candidate;
+    return clamp(bounded, 0, TRADING_DAY_MINUTES);
   }
 
   function selectedMinute() {

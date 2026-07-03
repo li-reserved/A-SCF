@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>A股资金流向大屏</title>
-  <link rel="stylesheet" href="./styles.css?v=20260702-client-stability">
+  <link rel="stylesheet" href="./styles.css?v=20260703-scrub-current">
 </head>
 <body>
   <div class="app-shell">
@@ -64,7 +64,9 @@
         <div class="time-scrubber" id="timeScrubber" aria-label="盘中时间回看">
           <div class="time-scrubber-main">
             <strong id="timeScrubLabel">当前 --:--</strong>
-            <input id="timeScrubRange" type="range" min="0" max="240" step="1" value="240" aria-label="选择盘中时间">
+            <div class="time-scrubber-track" id="timeScrubTrack">
+              <input id="timeScrubRange" type="range" min="0" max="240" step="1" value="240" aria-label="选择盘中时间">
+            </div>
             <button id="timeNowBtn" type="button">当前</button>
           </div>
           <div class="time-scrubber-scale" aria-hidden="true">
@@ -117,6 +119,6 @@
     </main>
   </div>
 
-  <script src="./app.js?v=20260702-client-stability"></script>
+  <script src="./app.js?v=20260703-scrub-current"></script>
 </body>
 </html>
