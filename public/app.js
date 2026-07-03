@@ -453,10 +453,6 @@
     return TRADING_DAY_MINUTES * pct;
   }
 
-  function isFutureScrubPointer(event) {
-    return pointerMinute(event) > availableEndMinute() + 0.5;
-  }
-
   function updateMobileStrip() {
     if (!els.mobileStrip) return;
     const metric = activeMetric();
@@ -1156,16 +1152,10 @@
       renderAll();
     });
     els.timeRange?.addEventListener('input', () => {
-      if (state.scrubDragging) setScrubMinuteFast(els.timeRange.value);
-      else setScrubMinute(els.timeRange.value);
+      if (state.scrubDragging) return;
+      setScrubMinute(els.timeRange.value);
     });
     els.timeRange?.addEventListener('pointerdown', event => {
-      if (isFutureScrubPointer(event)) {
-        event.preventDefault();
-        state.scrubMinute = null;
-        renderAll();
-        return;
-      }
       state.scrubDragging = true;
       els.timeRange.setPointerCapture?.(event.pointerId);
       setScrubFromPointer(event);
