@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>A股资金流向大屏</title>
-  <link rel="stylesheet" href="./styles.css?v=20260703-scrub-drag-fix">
+  <link rel="stylesheet" href="./styles.css?v=20260706-record-smooth">
 </head>
 <body>
   <div class="app-shell">
@@ -43,6 +43,13 @@
               <button type="button" data-mode="price">分时</button>
               <button type="button" data-mode="dual">同屏</button>
             </div>
+            <button class="focus-toggle-btn" id="focusToggleBtn" type="button">大类</button>
+            <div class="date-control">
+              <input id="tradeDateInput" type="date" aria-label="选择回溯日期">
+              <button class="date-picker-btn" id="datePickerBtn" type="button" aria-label="打开日期选择器"></button>
+              <div class="date-menu" id="dateMenu" hidden></div>
+            </div>
+            <button class="date-today-btn" id="dateTodayBtn" type="button">今日</button>
             <label>
               <span>排序</span>
               <select id="sortMode">
@@ -54,6 +61,19 @@
             </label>
             <button class="ghost-btn" id="pauseBtn" type="button">暂停</button>
           </div>
+        </div>
+
+        <div class="focus-panel" id="focusPanel" hidden>
+          <div class="focus-panel-head">
+            <strong>大类 <span id="focusCount">31/31</span></strong>
+            <div class="focus-panel-actions">
+              <button id="focusSelectAllBtn" type="button" hidden>全选</button>
+              <button id="focusLimitBtn" type="button">解除限制</button>
+              <button id="focusResetBtn" type="button">恢复默认</button>
+            </div>
+          </div>
+          <input id="focusSearch" type="search" placeholder="模糊搜索大类，如养殖、医疗" aria-label="搜索大类">
+          <div class="focus-candidates" id="focusCandidates" aria-label="全部大类"></div>
         </div>
 
         <div class="canvas-wrap" id="canvasWrap">
@@ -68,6 +88,11 @@
               <input id="timeScrubRange" type="range" min="0" max="240" step="1" value="240" aria-label="选择盘中时间">
             </div>
             <button id="timeNowBtn" type="button">当前</button>
+            <div class="replay-control">
+              <input id="replaySeconds" type="number" min="10" step="5" value="30" aria-label="回溯播放秒数">
+              <button id="replayBtn" type="button">播放</button>
+              <button id="recordBtn" type="button">录制</button>
+            </div>
           </div>
           <div class="time-scrubber-scale" aria-hidden="true">
             <span>09:30</span>
@@ -119,6 +144,6 @@
     </main>
   </div>
 
-  <script src="./app.js?v=20260703-scrub-drag-fix"></script>
+  <script src="./app.js?v=20260706-record-smooth"></script>
 </body>
 </html>

@@ -26,9 +26,11 @@ curl -fsS 'http://127.0.0.1:5177/api/fund-flow/overview?scope=all&limit=60'
 
 - 页面能打开。
 - 移动端图表不溢出。
-- 回放拖动不卡顿。
+- 日期选择、时间拖动和自动回溯播放正常。
+- Canvas 录制只包含图表画布，能开始/停止并下载视频。
 - 接口返回 `sourceStatus.text` 为 `真实数据`。
-- `series.length` 为 31 左右。
+- 默认 `series.length` 不超过 31；解除限制并传 `focusLimit=all` 时可以返回更多大类。
+- `/api/fund-flow/focus-groups` 能返回可选择的大类列表。
 
 ## 3. 上线到 Vercel
 
@@ -48,6 +50,7 @@ https://a-share-fund-flow-sepia.vercel.app
 
 ```text
 /api/fund-flow/overview?scope=all&limit=60
+/api/fund-flow/focus-groups
 ```
 
 ## 4. 上线后校验
@@ -56,6 +59,8 @@ https://a-share-fund-flow-sepia.vercel.app
 curl -fsS 'https://a-share-fund-flow-sepia.vercel.app/app.js' | rg 'setScrubMinuteFast|selectEvenLabels'
 
 curl -fsS 'https://a-share-fund-flow-sepia.vercel.app/api/fund-flow/overview?scope=all&limit=60'
+
+curl -fsS 'https://a-share-fund-flow-sepia.vercel.app/api/fund-flow/focus-groups'
 ```
 
 如果手机微信里还是旧样式，先刷新页面或重新打开链接，微信内置浏览器可能有缓存。
@@ -81,4 +86,5 @@ http://127.0.0.1:5177/
 - 页面和线上 API 都使用东方财富公开资金流接口。
 - 线上没有使用模拟资金数据。
 - 云函数有执行时间限制，分钟线可能比本地版本更容易降级为当前真实净额。
+- 本地走势存档写入 `data/fund-flow-trends.json`，该文件不提交；线上环境不依赖本地存档文件持久化。
 - 这不是交易级实时行情，真实数据受东方财富接口延迟、限流和稳定性影响。

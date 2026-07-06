@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { readFile, stat } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
-import { extname, join, normalize, resolve } from 'node:path';
+import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
@@ -13,13 +13,18 @@ const rootDir = resolve(__dirname, '..');
 const pageDir = join(rootDir, 'public');
 const port = Number(process.env.FUND_FLOW_PORT || process.env.PORT || 5177);
 const aktoolsBase = process.env.AKTOOLS_BASE_URL || 'http://127.0.0.1:8080';
+const trendStorePath = process.env.FUND_FLOW_TREND_DB_PATH || join(rootDir, 'data', 'fund-flow-trends.json');
+const trendStoreEnabled = process.env.FUND_FLOW_TREND_STORE !== '0';
 const refreshAfterMs = Number(process.env.FUND_FLOW_REFRESH_MS || 8000);
 const cacheTtlMs = Number(process.env.FUND_FLOW_CACHE_MS || 8000);
+const focusSourceCacheTtlMs = Number(process.env.FUND_FLOW_FOCUS_SOURCE_CACHE_MS || 60000);
 const minuteCacheTtlMs = Number(process.env.FUND_FLOW_MINUTE_CACHE_MS || 15000);
+const historicalDayCacheTtlMs = Number(process.env.FUND_FLOW_HISTORY_DAY_CACHE_MS || 6 * 60 * 60 * 1000);
 const prefetchIntervalMs = Number(process.env.FUND_FLOW_PREFETCH_MS || 12000);
 const minuteFetchLimit = Number(process.env.FUND_FLOW_KLINE_LIMIT || 72);
 const minuteFetchPerGroup = Number(process.env.FUND_FLOW_KLINE_PER_GROUP || 4);
 const priceFetchLimit = Number(process.env.FUND_FLOW_PRICE_LIMIT || 60);
+const historyTrendDays = Number(process.env.FUND_FLOW_HISTORY_TREND_DAYS || 5);
 const overviewFetchTimeoutMs = Number(process.env.FUND_FLOW_OVERVIEW_TIMEOUT_MS || 5600);
 const responseHydrateWaitMs = Number(process.env.FUND_FLOW_RESPONSE_HYDRATE_MS || 450);
 const eastmoneyTaskTimeoutMs = Number(process.env.FUND_FLOW_EASTMONEY_TASK_TIMEOUT_MS || 4200);
@@ -33,6 +38,7 @@ const rankFetchTimeoutMs = Number(process.env.FUND_FLOW_RANK_TIMEOUT_MS || 3600)
 const rankPageSize = Number(process.env.FUND_FLOW_RANK_PAGE_SIZE || 60);
 const tradingDayMinutes = 240;
 const snapshotLimit = 96;
+const focusGroupLimit = 31;
 const rankFetchSize = {
   industry: 360,
   concept: 420,
@@ -65,7 +71,7 @@ const emFlowMinuteHosts = [
   'push2his.eastmoney.com',
   'push2.eastmoney.com'
 ];
-const focusGroups = [
+const defaultFocusGroups = [
   { key: 'nonferrous', name: '有色金属', preferred: ['有色金属'], match: ['有色金属', '工业金属', '小金属', '贵金属'] },
   { key: 'humanoid-robot', name: '人形机器人', preferred: ['人形机器人'], match: ['人形机器人', '机器人概念', '机器人'] },
   { key: 'power', name: '电力', preferred: ['电力', '公用事业'], match: ['电力', '公用事业', '火力发电', '水力发电'] },
@@ -99,16 +105,76 @@ const focusGroups = [
   { key: 'communication-tech', name: '通信技术', preferred: ['通信技术'], match: ['通信技术', '通信设备', '通信', '5G', '6G'] }
 ];
 
+const extraFocusGroups = [
+  { key: 'medical', name: '医疗', preferred: ['医疗器械概念', '医疗服务', '医药医疗风格'], match: ['医疗', '医药', '医疗器械', '医疗服务', '互联医疗'] },
+  { key: 'medicine', name: '医药', preferred: ['医药商业', '化学制药', '生物制品'], match: ['医药', '制药', '生物医药', '创新药', '中药'] },
+  { key: 'traditional-medicine', name: '中药', preferred: ['中药'], match: ['中药', '中成药'] },
+  { key: 'medical-equipment', name: '医疗器械', preferred: ['医疗器械概念', '医疗设备'], match: ['医疗器械', '医疗设备'] },
+  { key: 'medical-beauty', name: '医美', preferred: ['医美概念'], match: ['医美', '美容护理'] },
+  { key: 'cro', name: 'CRO', preferred: ['CRO', '医疗研发外包'], match: ['CRO', '医疗研发外包', 'CXO'] },
+  { key: 'breeding', name: '养殖', preferred: ['养殖业', '生猪养殖', '水产养殖'], match: ['养殖', '生猪', '肉鸡', '水产', '猪肉', '鸡肉'] },
+  { key: 'agriculture', name: '农业', preferred: ['农牧饲渔', '种植业', '农业种植'], match: ['农业', '农牧', '种植', '种业', '粮食'] },
+  { key: 'seed', name: '种业', preferred: ['种业'], match: ['种业', '转基因', '粮食'] },
+  { key: 'animal-feed', name: '饲料', preferred: ['饲料'], match: ['饲料', '农牧'] },
+  { key: 'food-beverage', name: '食品饮料', preferred: ['食品饮料', '食品加工制造'], match: ['食品', '饮料', '乳业', '预制菜'] },
+  { key: 'retail', name: '零售', preferred: ['零售', '商业百货'], match: ['零售', '商业百货', '新零售'] },
+  { key: 'tourism', name: '旅游酒店', preferred: ['旅游酒店', '酒店餐饮'], match: ['旅游', '酒店', '景点'] },
+  { key: 'textile-apparel', name: '纺织服装', preferred: ['纺织服装'], match: ['纺织', '服装', '纺织服饰'] },
+  { key: 'home-appliance', name: '家电', preferred: ['家电行业', '白色家电'], match: ['家电', '白色家电', '黑色家电', '小家电'] },
+  { key: 'home-furnishing', name: '家居', preferred: ['家居用品', '装修建材'], match: ['家居', '家具', '装修建材'] },
+  { key: 'automobile', name: '汽车', preferred: ['汽车整车', '汽车零部件'], match: ['汽车', '整车', '汽车零部件'] },
+  { key: 'new-energy-vehicle', name: '新能源车', preferred: ['新能源汽车', '新能源车'], match: ['新能源汽车', '新能源车', '汽车热管理'] },
+  { key: 'auto-parts', name: '汽车零部件', preferred: ['汽车零部件'], match: ['汽车零部件', '减速器', '一体化压铸'] },
+  { key: 'photovoltaic', name: '光伏', preferred: ['光伏设备', '太阳能'], match: ['光伏', '太阳能', 'HJT电池', 'TOPCon'] },
+  { key: 'wind-power', name: '风电', preferred: ['风电设备', '风能'], match: ['风电', '风能'] },
+  { key: 'nuclear-power', name: '核电', preferred: ['核电', '核能核电'], match: ['核电', '核能'] },
+  { key: 'hydrogen-energy', name: '氢能', preferred: ['氢能源'], match: ['氢能', '氢能源', '燃料电池'] },
+  { key: 'low-altitude', name: '低空经济', preferred: ['低空经济', '飞行汽车'], match: ['低空经济', '飞行汽车', '无人机', 'eVTOL'] },
+  { key: 'military', name: '军工', preferred: ['军工', '航天军工', '军工电子'], match: ['军工', '国防', '航天', '军工电子'] },
+  { key: 'software', name: '软件', preferred: ['软件开发', '软件服务'], match: ['软件', '信创', '国产软件', '操作系统'] },
+  { key: 'internet-service', name: '互联网服务', preferred: ['互联网服务'], match: ['互联网服务', '互联金融', '电子商务'] },
+  { key: 'cloud-computing', name: '云计算', preferred: ['云计算', '东数西算'], match: ['云计算', '东数西算', '数据中心', '服务器'] },
+  { key: 'data-center', name: '数据中心', preferred: ['数据中心', '东数西算'], match: ['数据中心', 'IDC', '东数西算', '服务器'] },
+  { key: 'cyber-security', name: '网络安全', preferred: ['网络安全'], match: ['网络安全', '数据安全', '信息安全'] },
+  { key: 'media', name: '传媒', preferred: ['文化传媒', '传媒'], match: ['传媒', '文化传媒', '影视', '短剧'] },
+  { key: 'education', name: '教育', preferred: ['教育'], match: ['教育', '职业教育', '在线教育'] },
+  { key: 'real-estate', name: '房地产', preferred: ['房地产开发', '房地产'], match: ['房地产', '地产', '租售同权'] },
+  { key: 'construction', name: '建筑', preferred: ['工程建设', '建筑装饰'], match: ['建筑', '工程建设', '建筑装饰'] },
+  { key: 'building-materials', name: '建材', preferred: ['装修建材', '水泥建材'], match: ['建材', '水泥', '玻璃玻纤'] },
+  { key: 'steel', name: '钢铁', preferred: ['钢铁行业'], match: ['钢铁', '特钢'] },
+  { key: 'rare-earth', name: '稀土', preferred: ['稀土永磁', '小金属'], match: ['稀土', '稀土永磁', '小金属'] },
+  { key: 'gold', name: '黄金', preferred: ['黄金概念', '贵金属'], match: ['黄金', '贵金属'] },
+  { key: 'oil-gas', name: '油气', preferred: ['石油行业', '油气设服'], match: ['石油', '油气', '天然气', '可燃冰'] },
+  { key: 'environmental', name: '环保', preferred: ['环保行业', '环境保护'], match: ['环保', '环境保护', '节能环保'] },
+  { key: 'water-affairs', name: '水务', preferred: ['公用事业', '水务'], match: ['水务', '供水', '污水处理'] },
+  { key: 'logistics', name: '物流', preferred: ['物流行业', '快递概念'], match: ['物流', '快递', '仓储物流'] },
+  { key: 'shipping-port', name: '航运港口', preferred: ['航运港口', '港口水运'], match: ['航运', '港口', '海运'] },
+  { key: 'airport-aviation', name: '机场航空', preferred: ['机场航空'], match: ['机场', '航空', '航空机场'] },
+  { key: 'rail-transit', name: '轨交设备', preferred: ['交运设备', '轨道交通'], match: ['轨交', '轨道交通', '高铁'] },
+  { key: 'insurance', name: '保险', preferred: ['保险'], match: ['保险'] },
+  { key: 'diversified-finance', name: '多元金融', preferred: ['多元金融'], match: ['多元金融', '期货', '租赁'] },
+  { key: 'industrial-machine', name: '工业母机', preferred: ['工业母机', '机床制造'], match: ['工业母机', '机床', '数控机床'] },
+  { key: 'machine-vision', name: '机器视觉', preferred: ['机器视觉'], match: ['机器视觉', '工业视觉'] },
+  { key: 'smart-manufacturing', name: '智能制造', preferred: ['智能制造', '工业4.0'], match: ['智能制造', '工业4.0', '工业互联网'] }
+];
+
+const availableFocusGroups = uniqueFocusGroups([...extraFocusGroups, ...defaultFocusGroups]);
+
 const memory = {
   cachedByScope: new Map(),
   snapshots: new Map(),
   minuteCached: new Map(),
+  flowDailyCached: new Map(),
   priceCached: new Map(),
+  trendStore: new Map(),
+  trendStoreLoaded: false,
   focusLastByKey: new Map(),
   loadingByScope: new Map(),
   minuteHydrating: false,
   priceHydrating: false
 };
+
+let trendStoreWriteQueue = Promise.resolve();
 
 const mime = {
   '.html': 'text/html; charset=utf-8',
@@ -134,6 +200,14 @@ async function handleRequest(req, res) {
       await handleOverview(url, res);
       return;
     }
+    if (url.pathname === '/api/fund-flow/focus-groups') {
+      sendJson(res, 200, {
+        updatedAt: new Date().toISOString(),
+        limit: focusGroupLimit,
+        focusCandidates: buildFocusCandidates([])
+      });
+      return;
+    }
     await handleStatic(url.pathname, res);
   } catch (err) {
     sendJson(res, 500, { error: err.message || 'server error' });
@@ -156,18 +230,35 @@ async function handleOverview(url, res) {
   const limit = clamp(Number(url.searchParams.get('limit') || 30), 10, 60);
   const scope = url.searchParams.get('scope') || 'all';
   const force = url.searchParams.get('force') === '1';
-  const cacheKey = scope === 'all' ? 'focus' : scope;
-  const cached = memory.cachedByScope.get(cacheKey);
-  if (!force && cached && now - cached.cachedAt < cacheTtlMs) {
-    applyMinutePointsToSeries(cached.payload.series);
-    const filtered = await prepareFilteredPayload(cached.payload, scope, limit, 0);
+  const requestedDate = normalizeTradeDate(url.searchParams.get('date'));
+  const focusLimit = focusLimitForRequest(url);
+  const focusNames = normalizeFocusNames(url.searchParams.get('focus'), focusLimit);
+  const singleFocus = url.searchParams.get('single') === '1' || (scope === 'all' && focusNames.length === 1);
+  const focusKey = focusViewKey(focusNames);
+  const historical = isHistoricalTradeDate(requestedDate);
+  const cacheKey = scopedCacheKey(scope, requestedDate, focusKey);
+  const sourceCacheKey = sourceScopedCacheKey(scope, requestedDate);
+  if (historical) {
+    const storedPayload = await loadStoredTrendPayload(scope, requestedDate, displayLimitForScope(scope, limit, focusLimit), focusKey);
+    if (storedPayload) {
+      sendJson(res, 200, storedPayload);
+      return;
+    }
+  }
+  const cached = memory.cachedByScope.get(sourceCacheKey);
+  const sourceTtlMs = singleFocus ? Math.max(cacheTtlMs, focusSourceCacheTtlMs) : cacheTtlMs;
+  if (!force && cached && now - cached.cachedAt < sourceTtlMs) {
+    applyMinutePointsToSeries(cached.payload.series, requestedDate);
+    applyPricePointsToSeries(cached.payload.series, requestedDate);
+    const filtered = await prepareFilteredPayload(cached.payload, scope, limit, 0, force, requestedDate, focusNames, focusLimit);
+    await maybePersistTodayTrend(filtered, scope, requestedDate, focusKey);
     sendJson(res, 200, filtered);
-    if (scope === 'all' || scope === 'industry' || scope === 'concept') scheduleMinuteHydration(cached.payload.series);
-    if (scope === 'all' || scope === 'industry' || scope === 'concept') schedulePriceHydration(cached.payload.series);
+    if (!historical && (scope === 'all' || scope === 'industry' || scope === 'concept')) scheduleMinuteHydration(cached.payload.series, false, requestedDate);
+    if (!historical && (scope === 'all' || scope === 'industry' || scope === 'concept')) schedulePriceHydration(cached.payload.series, false, requestedDate);
     return;
   }
 
-  const loadPromise = startOverviewLoad(cacheKey, limit, scope, force);
+  const loadPromise = startOverviewLoad(sourceCacheKey, limit, scope, force, requestedDate);
   const loaded = await withTimeout(loadPromise, overviewFetchTimeoutMs).catch(err => ({
     result: {
       series: [],
@@ -189,31 +280,326 @@ async function handleOverview(url, res) {
         detail: '当前资金流接口暂时未返回可用行业/概念数据，页面保留上一帧真实数据，后台继续刷新。'
       }
     };
-    sendJson(res, 200, await prepareFilteredPayload(stalePayload, scope, limit, 0));
+    const filtered = await prepareFilteredPayload(stalePayload, scope, limit, 0, force, requestedDate, focusNames, focusLimit);
+    await maybePersistTodayTrend(filtered, scope, requestedDate, focusKey);
+    sendJson(res, 200, filtered);
     return;
   }
 
   if (!loaded.payload) {
-    sendJson(res, 200, normalizePayload([], loaded.result.status));
+    sendJson(res, 200, normalizePayload([], loaded.result.status, requestedDate));
     return;
   }
 
   const payload = loaded.payload;
-  sendJson(res, 200, await prepareFilteredPayload(payload, scope, limit, force ? responseHydrateWaitMs * 2 : responseHydrateWaitMs, force));
-  if (scope === 'all' || scope === 'industry' || scope === 'concept') scheduleMinuteHydration(payload.series, force);
-  if (scope === 'all' || scope === 'industry' || scope === 'concept') schedulePriceHydration(payload.series, force);
+  const hydrateWait = historical ? Math.max(13000, responseHydrateWaitMs * 28) : (force ? responseHydrateWaitMs * 2 : responseHydrateWaitMs);
+  const filtered = await prepareFilteredPayload(payload, scope, limit, hydrateWait, force, requestedDate, focusNames, focusLimit);
+  await maybePersistTodayTrend(filtered, scope, requestedDate, focusKey);
+  sendJson(res, 200, filtered);
+  if (!historical && (scope === 'all' || scope === 'industry' || scope === 'concept')) scheduleMinuteHydration(payload.series, force, requestedDate);
+  if (!historical && (scope === 'all' || scope === 'industry' || scope === 'concept')) schedulePriceHydration(payload.series, force, requestedDate);
 }
 
-function startOverviewLoad(cacheKey, limit, scope, force = false) {
+function normalizeTradeDate(value) {
+  const today = formatDate(new Date());
+  const text = String(value || today).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return today;
+  return text > today ? today : text;
+}
+
+function isHistoricalTradeDate(tradeDate) {
+  return normalizeTradeDate(tradeDate) !== formatDate(new Date());
+}
+
+function displayLimitForScope(scope, limit, focusLimit = focusGroupLimit) {
+  return scope === 'all' ? focusLimit : limit;
+}
+
+function focusLimitForRequest(url) {
+  const raw = url.searchParams.get('focusLimit');
+  if (raw === 'all' || raw === 'unlimited') return availableFocusGroups.length;
+  const value = Number(raw);
+  if (Number.isFinite(value) && value > 0) return clamp(Math.round(value), 1, availableFocusGroups.length);
+  return focusGroupLimit;
+}
+
+function normalizeFocusNames(value, limit = focusGroupLimit) {
+  return uniqueValues(String(value || '')
+    .split(',')
+    .map(item => normalizeFocusName(item))
+    .filter(Boolean))
+    .slice(0, limit);
+}
+
+function normalizeFocusName(value) {
+  return String(value || '')
+    .replace(/[<>]/g, '')
+    .replace(/\s+/g, '')
+    .trim()
+    .slice(0, 24);
+}
+
+function uniqueValues(values) {
+  const seen = new Set();
+  return values.filter(value => {
+    const key = normalizeBoardName(value);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function uniqueFocusGroups(groups) {
+  const seen = new Set();
+  return groups.filter(group => {
+    const key = normalizeBoardName(group.name);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function focusViewKey(names) {
+  return Array.isArray(names) && names.length ? names.join('|') : 'default';
+}
+
+function scopedCacheKey(scope, tradeDate, focusKey = 'default') {
+  const scopeKey = scope === 'all' ? 'focus' : scope;
+  const suffix = scope === 'all' ? `:${focusKey || 'default'}` : '';
+  return `${tradeDate || formatDate(new Date())}:${scopeKey}${suffix}`;
+}
+
+function sourceScopedCacheKey(scope, tradeDate) {
+  const scopeKey = scope === 'all' ? 'focus-source' : scope;
+  return `${tradeDate || formatDate(new Date())}:${scopeKey}`;
+}
+
+function securityCacheKey(item, tradeDate) {
+  return `${tradeDate || formatDate(new Date())}:${item.market}.${item.code}`;
+}
+
+function trendStoreKey(scope, tradeDate, focusKey = 'default') {
+  const scopeKey = scope === 'all' ? 'focus' : scope;
+  const suffix = scope === 'all' ? `:${focusKey || 'default'}` : '';
+  return `${tradeDate || formatDate(new Date())}:${scopeKey}${suffix}`;
+}
+
+async function loadStoredTrendPayload(scope, requestedDate, limit, focusKey = 'default') {
+  if (!trendStoreEnabled || !isHistoricalTradeDate(requestedDate)) return null;
+  await ensureTrendStoreLoaded();
+  const entry = memory.trendStore.get(trendStoreKey(scope, requestedDate, focusKey));
+  const payload = entry?.payload;
+  if (!payload?.series?.length) return null;
+  const series = payload.series
+    .map(item => cloneTrendSeriesItem(item, requestedDate))
+    .slice(0, limit);
+  return {
+    ...payload,
+    updatedAt: entry.storedAt || payload.updatedAt || new Date().toISOString(),
+    tradeDate: requestedDate,
+    requestedDate,
+    timeline: payload.timeline || timelineForTradeDate(requestedDate),
+    series,
+    leaders: buildLeaders(series),
+    breakdown: buildBreakdown(series),
+    sourceStatus: {
+      level: 'live',
+      text: '本地存档',
+      detail: `命中本地走势库：${requestedDate} ${scope}，由盘中用户查询覆盖写入。`
+    },
+    note: `${payload.note || '历史走势来自本地查询存档。'} 本次优先使用本地走势库。`
+  };
+}
+
+async function maybePersistTodayTrend(payload, scope, requestedDate, focusKey = 'default') {
+  if (!trendStoreEnabled || !shouldPersistTodayTrend(requestedDate) || !payload?.series?.length) return;
+  trendStoreWriteQueue = trendStoreWriteQueue
+    .catch(() => {})
+    .then(async () => {
+      await ensureTrendStoreLoaded();
+      const key = trendStoreKey(scope, requestedDate, focusKey);
+      const existing = memory.trendStore.get(key)?.payload;
+      const nextPayload = clonePayloadForTrendStore(payload, requestedDate);
+      const entry = {
+        storedAt: new Date().toISOString(),
+        scope,
+        tradeDate: requestedDate,
+        payload: mergeStoredTrendPayload(existing, nextPayload, requestedDate)
+      };
+      memory.trendStore.set(key, entry);
+      await flushTrendStore();
+    })
+    .catch(err => {
+      console.warn(`走势库写入失败：${err?.message || err}`);
+    });
+  await trendStoreWriteQueue;
+}
+
+function shouldPersistTodayTrend(requestedDate) {
+  if (requestedDate !== formatDate(new Date())) return false;
+  const timeline = tradingTimeline();
+  return timeline.elapsed > 0 && timeline.session !== 'closed';
+}
+
+async function ensureTrendStoreLoaded() {
+  if (memory.trendStoreLoaded) return;
+  memory.trendStoreLoaded = true;
+  try {
+    const raw = await readFile(trendStorePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    Object.entries(parsed?.entries || {}).forEach(([key, entry]) => {
+      if (entry?.payload?.series?.length) memory.trendStore.set(key, entry);
+    });
+  } catch (err) {
+    if (err?.code !== 'ENOENT') console.warn(`走势库读取失败：${err?.message || err}`);
+  }
+}
+
+async function flushTrendStore() {
+  const entries = Object.fromEntries(memory.trendStore.entries());
+  const body = JSON.stringify({
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    entries
+  }, null, 2);
+  await mkdir(dirname(trendStorePath), { recursive: true });
+  const tmpPath = `${trendStorePath}.${process.pid}.tmp`;
+  await writeFile(tmpPath, body, 'utf8');
+  await rename(tmpPath, trendStorePath);
+}
+
+function clonePayloadForTrendStore(payload, requestedDate) {
+  const series = (payload.series || []).map(item => cloneTrendSeriesItem(item, requestedDate));
+  return {
+    updatedAt: payload.updatedAt || new Date().toISOString(),
+    tradeDate: requestedDate,
+    requestedDate,
+    refreshAfterMs: payload.refreshAfterMs || refreshAfterMs,
+    sourceStatus: payload.sourceStatus || { level: 'live', text: '真实数据', detail: '盘中查询写入走势库。' },
+    timeline: payload.timeline || timelineForTradeDate(requestedDate),
+    series,
+    leaders: buildLeaders(series),
+    breakdown: buildBreakdown(series),
+    note: payload.note || '盘中用户查询写入的本地走势。'
+  };
+}
+
+function cloneTrendSeriesItem(item, requestedDate) {
+  const points = cloneTrendPoints(item.points, requestedDate);
+  const pricePoints = cloneTrendPoints(item.pricePoints, requestedDate);
+  const pointSource = normalizeStoredPointSource(item.pointSource, points);
+  const pricePointSource = normalizeStoredPointSource(item.pricePointSource || 'fallback', pricePoints, true);
+  return {
+    id: item.id,
+    name: item.name,
+    category: item.category,
+    code: item.code,
+    market: item.market,
+    sourceName: item.sourceName,
+    sourceCategory: item.sourceCategory,
+    sourceCode: item.sourceCode,
+    sourceId: item.sourceId,
+    latest: round(item.latest),
+    rank: item.rank,
+    changePct: round(item.changePct),
+    pointSource,
+    points,
+    pricePointSource,
+    pricePoints,
+    rawBreakdown: item.rawBreakdown ? { ...item.rawBreakdown } : undefined
+  };
+}
+
+function normalizeStoredPointSource(source, points, price = false) {
+  if (source === 'missing') return 'missing';
+  if (source === 'minute' || source === 'daily') return source;
+  if (source === 'stored') return 'stored';
+  if (Array.isArray(points) && points.length > (price ? 2 : 1)) return 'stored';
+  return source || (price ? 'fallback' : 'snapshot');
+}
+
+function mergeStoredTrendPayload(existing, incoming, requestedDate) {
+  if (!existing?.series?.length) return incoming;
+  const existingByKey = new Map(existing.series.map(item => [trendSeriesKey(item), item]));
+  const mergedSeries = incoming.series.map(item => mergeStoredSeriesItem(existingByKey.get(trendSeriesKey(item)), item, requestedDate));
+  existing.series.forEach(item => {
+    if (!mergedSeries.some(next => trendSeriesKey(next) === trendSeriesKey(item))) mergedSeries.push(item);
+  });
+  return {
+    ...incoming,
+    series: mergedSeries,
+    leaders: buildLeaders(mergedSeries),
+    breakdown: buildBreakdown(mergedSeries)
+  };
+}
+
+function mergeStoredSeriesItem(existing, incoming, requestedDate) {
+  if (!existing) return incoming;
+  const points = mergeTrendPoints(existing.points, incoming.points, requestedDate);
+  const pricePoints = mergeTrendPoints(existing.pricePoints, incoming.pricePoints, requestedDate);
+  const latestPoint = points.at(-1);
+  const latest = Number.isFinite(Number(latestPoint?.value)) ? round(latestPoint.value) : incoming.latest;
+  return {
+    ...existing,
+    ...incoming,
+    latest,
+    points,
+    pointSource: bestStoredSource(existing.pointSource, incoming.pointSource, points),
+    pricePoints,
+    pricePointSource: bestStoredSource(existing.pricePointSource, incoming.pricePointSource, pricePoints, true),
+    rawBreakdown: incoming.rawBreakdown || existing.rawBreakdown
+  };
+}
+
+function trendSeriesKey(item) {
+  return item?.sourceId || item?.id || `${item?.category || ''}:${item?.sourceCode || item?.code || item?.name || ''}`;
+}
+
+function mergeTrendPoints(previous, next, requestedDate) {
+  const byMinute = new Map();
+  [...cloneTrendPoints(previous, requestedDate), ...cloneTrendPoints(next, requestedDate)].forEach(point => {
+    const minute = timeToMinute(point.time);
+    if (!Number.isFinite(minute)) return;
+    byMinute.set(minute, point);
+  });
+  return [...byMinute.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, point]) => point);
+}
+
+function bestStoredSource(previous, next, points, price = false) {
+  if (next === 'missing') return previous === 'missing' ? 'missing' : normalizeStoredPointSource(previous, points, price);
+  if (next === 'minute' || previous === 'minute') return 'minute';
+  if (next === 'daily' || previous === 'daily') return 'daily';
+  return normalizeStoredPointSource(next || previous, points, price);
+}
+
+function cloneTrendPoints(points, requestedDate) {
+  return (Array.isArray(points) ? points : [])
+    .map(point => {
+      const time = point?.time;
+      const value = Number(point?.value);
+      if (!time || !Number.isFinite(value)) return null;
+      return {
+        time,
+        value: round(value),
+        date: point.date || requestedDate,
+        ...(Number.isFinite(Number(point.price)) ? { price: Number(point.price) } : {})
+      };
+    })
+    .filter(Boolean);
+}
+
+function startOverviewLoad(cacheKey, limit, scope, force = false, requestedDate = formatDate(new Date())) {
   const current = memory.loadingByScope.get(cacheKey);
   if (!force && current) return current;
-  const promise = loadRealData(limit, scope)
+  const promise = loadRealData(limit, scope, requestedDate)
     .then(result => {
       if (!result.series.length) return { result, payload: null };
-      const payload = normalizePayload(result.series, result.status);
+      const payload = normalizePayload(result.series, result.status, requestedDate);
       if (!force) {
-        applyMinutePointsToSeries(payload.series);
-        applyPricePointsToSeries(payload.series);
+        applyMinutePointsToSeries(payload.series, requestedDate);
+        applyPricePointsToSeries(payload.series, requestedDate);
       }
       memory.cachedByScope.set(cacheKey, { payload, cachedAt: Date.now() });
       return { result, payload };
@@ -236,8 +622,8 @@ function startOverviewLoad(cacheKey, limit, scope, force = false) {
   return promise;
 }
 
-async function loadRealData(limit, scope) {
-  const eastmoney = await loadEastmoneyData(limit, scope);
+async function loadRealData(limit, scope, requestedDate = formatDate(new Date())) {
+  const eastmoney = await loadEastmoneyData(limit, scope, requestedDate);
   if (eastmoney.series.length) return eastmoney;
 
   const tasks = akTasksForScope(scope);
@@ -268,12 +654,12 @@ async function loadRealData(limit, scope) {
     status: {
       level: errors.length ? 'warn' : 'live',
       text: errors.length ? '部分实时' : 'AKTools实时',
-      detail: errors.length ? `部分接口失败：${errors.slice(0, 2).join('；')}` : '数据来自本地 AKTools/AKShare 代理，页面请求已做缓存和归一化。'
+      detail: historicalDetail(requestedDate, errors.length ? `部分接口失败：${errors.slice(0, 2).join('；')}` : '数据来自本地 AKTools/AKShare 代理，页面请求已做缓存和归一化。')
     }
   };
 }
 
-async function loadEastmoneyData(limit, scope) {
+async function loadEastmoneyData(limit, scope, requestedDate = formatDate(new Date())) {
   const tasks = eastmoneyTasksForScope(scope, limit);
   const settled = await Promise.allSettled(tasks.map(task => withTimeout(task, eastmoneyTaskTimeoutMs)));
   const series = [];
@@ -293,10 +679,15 @@ async function loadEastmoneyData(limit, scope) {
       level: series.length ? (errors.length ? 'warn' : 'live') : 'error',
       text: series.length ? (errors.length ? '部分实时' : '真实数据') : '真实源失败',
       detail: series.length
-        ? `数据来自东方财富公开资金流接口；资金图只展示真实资金分钟线或当前真实净额快照，不再用估算曲线冒充全天资金走势。地域、指数、个股、北向可在单独标签查看。${errors.length ? `部分分类未返回：${errors.slice(0, 2).join('；')}` : ''}`
+        ? historicalDetail(requestedDate, `数据来自东方财富公开资金流接口；资金图只展示真实资金分钟线或当前真实净额快照，不再用估算曲线冒充全天资金走势。地域、指数、个股、北向可在单独标签查看。${errors.length ? `部分分类未返回：${errors.slice(0, 2).join('；')}` : ''}`)
         : `东方财富资金流接口未返回可用数据：${errors.slice(0, 3).join('；')}`
     }
   };
+}
+
+function historicalDetail(requestedDate, detail) {
+  if (!isHistoricalTradeDate(requestedDate)) return detail;
+  return `${detail} 当前为 ${requestedDate} 回溯模式：资金图优先展示目标日真实资金净额，分钟线缺失时显示 15:00 日资金快照；不会用当日资金或估算曲线冒充历史走势。`;
 }
 
 function eastmoneyTasksForScope(scope, limit) {
@@ -444,7 +835,7 @@ function emIndexFlow(secid, name) {
   const promise = emJson('/api/qt/stock/fflow/daykline/get', params, 'push2his.eastmoney.com').then(payload => {
     const line = payload?.data?.klines?.[0];
     if (!line) throw new Error('empty kline');
-    const [date, main, superLarge, large, medium, small, mainPct] = String(line).split(',');
+    const [date, main, small, medium, large, superLarge, mainPct] = String(line).split(',');
     const latest = toYi(main);
     return [{
       id: `market-${secid}`,
@@ -559,43 +950,44 @@ function startPrefetchLoop() {
   setInterval(() => {
     const timeline = tradingTimeline();
     if (!timeline.isTradingTime) return;
-    startOverviewLoad('focus', 60, 'all', true)
+    const today = formatDate(new Date());
+    startOverviewLoad(scopedCacheKey('all', today), 60, 'all', true, today)
       .then(({ payload }) => {
         if (!payload?.series?.length) return;
-        scheduleMinuteHydration(payload.series, true);
-        schedulePriceHydration(payload.series, true);
+        scheduleMinuteHydration(payload.series, true, today);
+        schedulePriceHydration(payload.series, true, today);
       })
       .catch(() => {});
   }, prefetchIntervalMs).unref?.();
 }
 
-function scheduleMinuteHydration(series, force = false) {
+function scheduleMinuteHydration(series, force = false, requestedDate = formatDate(new Date())) {
   if (memory.minuteHydrating) return;
   memory.minuteHydrating = true;
   setTimeout(async () => {
     try {
-      await hydrateMinutePoints(series, force);
-      memory.cachedByScope.forEach(entry => applyMinutePointsToSeries(entry.payload.series));
+      await hydrateMinutePoints(series, force, requestedDate);
+      memory.cachedByScope.forEach(entry => applyMinutePointsToSeries(entry.payload.series, entry.payload.requestedDate || requestedDate));
     } finally {
       memory.minuteHydrating = false;
     }
   }, 0);
 }
 
-function schedulePriceHydration(series, force = false) {
+function schedulePriceHydration(series, force = false, requestedDate = formatDate(new Date())) {
   if (memory.priceHydrating) return;
   memory.priceHydrating = true;
   setTimeout(async () => {
     try {
-      await hydratePricePoints(series, force);
-      memory.cachedByScope.forEach(entry => applyPricePointsToSeries(entry.payload.series));
+      await hydratePricePoints(series, force, requestedDate);
+      memory.cachedByScope.forEach(entry => applyPricePointsToSeries(entry.payload.series, entry.payload.requestedDate || requestedDate));
     } finally {
       memory.priceHydrating = false;
     }
   }, 0);
 }
 
-async function hydrateMinutePoints(series, force = false) {
+async function hydrateMinutePoints(series, force = false, requestedDate = formatDate(new Date())) {
   const focusCandidates = selectMinuteCandidates(series);
   const focusIds = new Set(focusCandidates.map(item => item.id));
   const extraCount = Math.max(0, minuteFetchLimit - focusCandidates.length);
@@ -608,7 +1000,7 @@ async function hydrateMinutePoints(series, force = false) {
   for (const batch of batches) {
     await Promise.all(batch.map(async item => {
       try {
-        const points = await emFundFlowMinutePoints(item, force);
+        const points = await emFundFlowMinutePoints(item, force, requestedDate);
         if (points.length) {
           item.points = points;
           item.pointSource = 'minute';
@@ -620,11 +1012,11 @@ async function hydrateMinutePoints(series, force = false) {
   }
 }
 
-function applyMinutePointsToSeries(series) {
+function applyMinutePointsToSeries(series, requestedDate = formatDate(new Date())) {
   series.forEach(item => {
     const code = item.sourceCode || item.code;
     const market = item.sourceCode ? 90 : item.market;
-    const cached = market === 90 && code ? memory.minuteCached.get(`${market}.${code}`) : null;
+    const cached = market === 90 && code ? memory.minuteCached.get(`${requestedDate}:${market}.${code}`) : null;
     if (cached?.points?.length) {
       item.points = cached.points;
       item.pointSource = 'minute';
@@ -632,16 +1024,17 @@ function applyMinutePointsToSeries(series) {
   });
 }
 
-async function hydratePricePoints(series, force = false) {
+async function hydratePricePoints(series, force = false, requestedDate = formatDate(new Date())) {
   const candidates = selectPriceCandidates(series);
   const batches = chunk(candidates, 6);
   for (const batch of batches) {
     await Promise.all(batch.map(async item => {
       try {
-        const points = await emPriceTrendPoints(item, force);
+        const points = await emPriceTrendPoints(item, force, requestedDate);
         if (points.length) {
           item.pricePoints = points;
           item.pricePointSource = points.length > 10 ? 'minute' : 'fallback';
+          item.changePct = points.at(-1)?.value ?? item.changePct;
         }
       } catch {
         // Price trend is optional; the current changePct fallback remains available.
@@ -650,21 +1043,22 @@ async function hydratePricePoints(series, force = false) {
   }
 }
 
-function applyPricePointsToSeries(series) {
+function applyPricePointsToSeries(series, requestedDate = formatDate(new Date())) {
   series.forEach(item => {
     const code = item.sourceCode || item.code;
     const market = item.sourceCode ? 90 : item.market;
-    const cached = code ? memory.priceCached.get(`${market}.${code}`) : null;
+    const cached = code ? memory.priceCached.get(`${requestedDate}:${market}.${code}`) : null;
     if (cached?.points?.length) {
       item.pricePoints = cached.points;
       item.pricePointSource = cached.source || (cached.points.length > 10 ? 'minute' : 'fallback');
+      item.changePct = cached.points.at(-1)?.value ?? item.changePct;
     }
   });
 }
 
 function selectPriceCandidates(series) {
   const byId = new Map();
-  focusGroups.forEach(group => {
+  defaultFocusGroups.forEach(group => {
     const selected = selectFocusRepresentative(group, series);
     if (selected?.code && selected.market === 90) byId.set(selected.id, selected);
   });
@@ -679,7 +1073,7 @@ function selectPriceCandidates(series) {
 
 function selectMinuteCandidates(series) {
   const byId = new Map();
-  focusGroups.forEach(group => {
+  defaultFocusGroups.forEach(group => {
     const selected = selectFocusRepresentative(group, series);
     if (selected?.code && selected.market === 90) byId.set(selected.id, selected);
     findFocusMatches(group, series)
@@ -693,8 +1087,8 @@ function selectMinuteCandidates(series) {
     .slice(0, minuteFetchLimit);
 }
 
-async function emFundFlowMinutePoints(item, force = false) {
-  const cacheKey = `${item.market}.${item.code}`;
+async function emFundFlowMinutePoints(item, force = false, requestedDate = formatDate(new Date())) {
+  const cacheKey = securityCacheKey(item, requestedDate);
   const cached = memory.minuteCached.get(cacheKey);
   const now = Date.now();
   if (!force && cached && now - cached.cachedAt < minuteCacheTtlMs) return cached.points;
@@ -706,23 +1100,79 @@ async function emFundFlowMinutePoints(item, force = false) {
     fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63'
   };
   const rows = await emFundFlowMinuteRows(params);
-  const endMinute = tradingTimeline().elapsed;
+  const endMinute = timelineForTradeDate(requestedDate).elapsed;
   const parsed = rows
     .map(line => minuteKlineToPoint(line))
     .filter(Boolean);
-  const latestDate = parsed
-    .map(point => point.date)
-    .filter(Boolean)
-    .sort()
-    .at(-1);
   const points = parsed
-    .filter(point => !latestDate || point.date === latestDate)
+    .filter(point => point.date === requestedDate)
     .filter(point => timeToMinute(point.time) <= endMinute)
     .map(({ time, value, date }) => ({ time, value, date }));
   if (points.length) {
     memory.minuteCached.set(cacheKey, { cachedAt: now, points });
   }
   return points;
+}
+
+async function emFundFlowDailySnapshot(item, force = false, requestedDate = formatDate(new Date())) {
+  const cacheKey = securityCacheKey(item, requestedDate);
+  const cached = memory.flowDailyCached.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.cachedAt < historicalDayCacheTtlMs) return cached.snapshot;
+  const params = {
+    secid: `${item.market}.${item.code}`,
+    lmt: String(historicalDailyKlineLimit(requestedDate)),
+    klt: '101',
+    fields1: 'f1,f2,f3,f7',
+    fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63'
+  };
+  const payload = await emFundFlowMinuteJson('/api/qt/stock/fflow/daykline/get', params, 'push2his.eastmoney.com');
+  const line = (payload?.data?.klines || []).find(row => String(row).startsWith(`${requestedDate},`));
+  const snapshot = dayFlowLineToSnapshot(line);
+  if (snapshot) memory.flowDailyCached.set(cacheKey, { cachedAt: now, snapshot });
+  return snapshot;
+}
+
+function dayFlowLineToSnapshot(line) {
+  if (!line) return null;
+  const [date, main, small, medium, large, superLarge, mainPct, smallPct, mediumPct, largePct, superLargePct, close, changePct] = String(line).split(',');
+  const latest = toEastmoneyYi(main);
+  if (!Number.isFinite(latest)) return null;
+  return {
+    date,
+    latest,
+    changePct: toNumber(changePct) || 0,
+    points: [{ time: '15:00', value: latest, date }],
+    rawBreakdown: {
+      main: latest,
+      superLarge: toEastmoneyYi(superLarge),
+      large: toEastmoneyYi(large),
+      medium: toEastmoneyYi(medium),
+      small: toEastmoneyYi(small),
+      mainPct: toNumber(mainPct) || 0,
+      superLargePct: toNumber(superLargePct) || 0,
+      largePct: toNumber(largePct) || 0,
+      mediumPct: toNumber(mediumPct) || 0,
+      smallPct: toNumber(smallPct) || 0,
+      close: toNumber(close) || 0,
+      date
+    }
+  };
+}
+
+function historicalDailyKlineLimit(requestedDate) {
+  const minLimit = Math.max(10, historyTrendDays * 2);
+  const todayMs = tradeDateUtcMs(formatDate(new Date()));
+  const requestedMs = tradeDateUtcMs(requestedDate);
+  if (!Number.isFinite(todayMs) || !Number.isFinite(requestedMs)) return minLimit;
+  const calendarDays = Math.max(0, Math.ceil((todayMs - requestedMs) / 86400000));
+  return Math.trunc(clamp(Math.ceil(calendarDays * 1.8) + 12, minLimit, 360));
+}
+
+function tradeDateUtcMs(value) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return NaN;
+  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
 }
 
 async function emFundFlowMinuteRows(params) {
@@ -772,54 +1222,57 @@ async function emFundFlowMinuteJson(path, params, host) {
   }
 }
 
-async function emPriceTrendPoints(item, force = false) {
-  const cacheKey = `${item.market}.${item.code}`;
+async function emPriceTrendPoints(item, force = false, requestedDate = formatDate(new Date())) {
+  const cacheKey = securityCacheKey(item, requestedDate);
   const cached = memory.priceCached.get(cacheKey);
   const now = Date.now();
   if (!force && cached && now - cached.cachedAt < minuteCacheTtlMs) return cached.points;
+  const historical = isHistoricalTradeDate(requestedDate);
   const params = {
     secid: `${item.market}.${item.code}`,
     fields1: 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13',
     fields2: 'f51,f52,f53,f54,f55,f56,f57,f58',
     iscr: '0',
     iscca: '0',
-    ndays: '1',
+    ndays: historical ? String(clamp(historyTrendDays, 1, 5)) : '1',
     ut: 'fa5fd1943c7b386f172d6893dbfba10b'
   };
   let points = [];
   try {
     const payload = await emTrendJson('/api/qt/stock/trends2/get', params);
-    points = parseEastmoneyTrendPayload(payload);
+    points = parseEastmoneyTrendPayload(payload, requestedDate);
   } catch {
     points = [];
   }
   if (!points.length) {
-    points = await akBoardPriceTrendPoints(item);
+    points = await akBoardPriceTrendPoints(item, requestedDate);
   }
   if (points.length) memory.priceCached.set(cacheKey, { cachedAt: now, points, source: points.length > 10 ? 'minute' : 'fallback' });
   return points;
 }
 
-function parseEastmoneyTrendPayload(payload) {
+function parseEastmoneyTrendPayload(payload, requestedDate = formatDate(new Date())) {
   const rows = payload?.data?.trends || [];
-  const preClose = toNumber(payload?.data?.preClose || payload?.data?.prePrice);
-  if (!Number.isFinite(preClose) || !preClose) return [];
+  const payloadPreClose = toNumber(payload?.data?.preClose || payload?.data?.prePrice);
   const endMinute = tradingTimeline().elapsed;
   const parsed = rows
-    .map(line => priceTrendToPoint(line, preClose))
+    .map(line => priceTrendRow(line))
     .filter(Boolean);
-  const latestDate = parsed
-    .map(point => point.date)
-    .filter(Boolean)
-    .sort()
-    .at(-1);
-  return parsed
-    .filter(point => !latestDate || point.date === latestDate)
-    .filter(point => timeToMinute(point.time) <= endMinute)
-    .map(({ time, value, price, date }) => ({ time, value, price, date }));
+  const targetRows = parsed
+    .filter(point => point.date === requestedDate)
+    .filter(point => timeToMinute(point.time) <= (isHistoricalTradeDate(requestedDate) ? tradingDayMinutes : endMinute));
+  if (!targetRows.length) return [];
+  const preClose = preCloseForTrendDate(parsed, requestedDate, payloadPreClose);
+  if (!Number.isFinite(preClose) || !preClose) return [];
+  return targetRows.map(point => ({
+    time: point.time,
+    value: round(((point.price - preClose) / preClose) * 100),
+    price: point.price,
+    date: point.date
+  }));
 }
 
-async function akBoardPriceTrendPoints(item) {
+async function akBoardPriceTrendPoints(item, requestedDate = formatDate(new Date())) {
   const fn = item.category === 'industry'
     ? 'stock_board_industry_hist_min_em'
     : item.category === 'concept'
@@ -828,13 +1281,13 @@ async function akBoardPriceTrendPoints(item) {
   if (!fn || !item.name) return [];
   try {
     const payload = await callAktools(fn, { symbol: item.name, period: '1' }, 8000);
-    return parseAkBoardPricePayload(payload, item.changePct);
+    return parseAkBoardPricePayload(payload, item.changePct, requestedDate);
   } catch {
     return [];
   }
 }
 
-function parseAkBoardPricePayload(payload, latestPct) {
+function parseAkBoardPricePayload(payload, latestPct, requestedDate = formatDate(new Date())) {
   const rows = extractRows(payload);
   if (!rows.length) return [];
   const parsed = rows.map(row => {
@@ -845,25 +1298,18 @@ function parseAkBoardPricePayload(payload, latestPct) {
     const match = String(timeRaw).match(/(\d{4}-\d{2}-\d{2})?.*?(\d{2}:\d{2})/);
     if (!match) return null;
     return {
-      date: match[1] || '',
+      date: match[1] || requestedDate,
       time: match[2],
       close,
       pct: Number.isFinite(pct) ? pct : NaN
     };
   }).filter(Boolean);
-  const latestDate = parsed
-    .map(point => point.date)
-    .filter(Boolean)
-    .sort()
-    .at(-1);
+  const endMinute = isHistoricalTradeDate(requestedDate) ? tradingDayMinutes : tradingTimeline().elapsed;
   const todayRows = parsed
-    .filter(point => !latestDate || point.date === latestDate)
-    .filter(point => timeToMinute(point.time) <= tradingTimeline().elapsed);
+    .filter(point => point.date === requestedDate)
+    .filter(point => timeToMinute(point.time) <= endMinute);
   if (!todayRows.length) return [];
-  const first = todayRows[0];
-  const preClose = Number.isFinite(first.pct) && first.close
-    ? first.close / (1 + first.pct / 100)
-    : NaN;
+  const preClose = preCloseForAkDate(parsed, requestedDate);
   if (Number.isFinite(preClose) && preClose) {
     return todayRows.map(point => ({
       time: point.time,
@@ -872,6 +1318,7 @@ function parseAkBoardPricePayload(payload, latestPct) {
       date: point.date
     }));
   }
+  const first = todayRows[0];
   const open = first.close || 1;
   const points = todayRows.map(point => ({
     time: point.time,
@@ -891,14 +1338,57 @@ function parseAkBoardPricePayload(payload, latestPct) {
   return points;
 }
 
-function priceTrendToPoint(line, preClose) {
+function priceTrendRow(line) {
   const cells = String(line).split(',');
   const match = cells[0]?.match(/^(\d{4}-\d{2}-\d{2})\s(\d{2}:\d{2})$/);
   if (!match) return null;
-  const price = toNumber(cells[1]);
+  const price = firstPositiveNumber([cells[1], cells[2], cells[7]]);
   if (!Number.isFinite(price)) return null;
-  const value = round(((price - preClose) / preClose) * 100);
-  return { date: match[1], time: match[2], value, price };
+  return { date: match[1], time: match[2], price };
+}
+
+function firstPositiveNumber(values) {
+  for (const value of values) {
+    const num = toNumber(value);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+  return NaN;
+}
+
+function preCloseForTrendDate(points, requestedDate, payloadPreClose) {
+  const dates = uniqueSortedDates(points);
+  const targetIndex = dates.indexOf(requestedDate);
+  if (targetIndex < 0) return NaN;
+  if (targetIndex === dates.length - 1 && Number.isFinite(payloadPreClose) && payloadPreClose > 0) {
+    return payloadPreClose;
+  }
+  if (targetIndex > 0) {
+    const previousRows = points.filter(point => point.date === dates[targetIndex - 1]);
+    const previousClose = previousRows.at(-1)?.price;
+    if (Number.isFinite(previousClose) && previousClose > 0) return previousClose;
+  }
+  const first = points.find(point => point.date === requestedDate);
+  return Number.isFinite(first?.price) ? first.price : NaN;
+}
+
+function preCloseForAkDate(points, requestedDate) {
+  const targetRows = points.filter(point => point.date === requestedDate);
+  const first = targetRows[0];
+  if (first && Number.isFinite(first.pct) && first.close) {
+    return first.close / (1 + first.pct / 100);
+  }
+  const dates = uniqueSortedDates(points);
+  const targetIndex = dates.indexOf(requestedDate);
+  if (targetIndex > 0) {
+    const previousRows = points.filter(point => point.date === dates[targetIndex - 1]);
+    const previousClose = previousRows.at(-1)?.close;
+    if (Number.isFinite(previousClose) && previousClose > 0) return previousClose;
+  }
+  return Number.isFinite(first?.close) ? first.close : NaN;
+}
+
+function uniqueSortedDates(points) {
+  return [...new Set(points.map(point => point.date).filter(Boolean))].sort();
 }
 
 async function emTrendJson(path, params) {
@@ -1048,27 +1538,70 @@ function rowToSeries(row, category, source, index) {
   };
 }
 
-function normalizePayload(series, sourceStatus) {
+function normalizePayload(series, sourceStatus, requestedDate = formatDate(new Date())) {
   const normalized = series;
   const leaders = buildLeaders(normalized);
-  const timeline = tradingTimeline();
+  const timeline = timelineForTradeDate(requestedDate);
+  const historical = isHistoricalTradeDate(requestedDate);
   return {
     updatedAt: new Date().toISOString(),
-    tradeDate: formatDate(new Date()),
+    tradeDate: requestedDate,
+    requestedDate,
     refreshAfterMs,
     sourceStatus,
     timeline,
     series: normalized,
     leaders,
     breakdown: buildBreakdown(normalized),
-    note: '默认重点大类按代表板块展示，不做重叠概念求和；资金分钟线缺失时只展示真实净额快照，避免伪造全天资金走势。'
+    focusCandidates: buildFocusCandidates(normalized),
+    note: historical
+      ? '历史回溯展示目标日真实资金净额；资金分钟线缺失时只展示 15:00 日资金快照，避免伪造历史资金走势。'
+      : '默认重点大类按代表板块展示，不做重叠概念求和；资金分钟线缺失时只展示真实净额快照，避免伪造全天资金走势。'
   };
 }
 
-function filterPayload(payload, scope, limit) {
-  const scoped = scope === 'all' ? buildFocusSeries(payload.series) : payload.series.filter(item => item.category === scope);
-  const sorted = [...scoped].sort((a, b) => Math.abs(b.latest) - Math.abs(a.latest)).slice(0, limit);
-  applyPricePointsToSeries(sorted);
+function filterPayload(payload, scope, limit, requestedDate = payload.requestedDate || formatDate(new Date()), focusNames = [], focusLimit = focusGroupLimit) {
+  const maxLimit = displayLimitForScope(scope, limit, focusLimit);
+  const scoped = scope === 'all' ? buildFocusSeries(payload.series, focusNames) : payload.series.filter(item => item.category === scope);
+  const sorted = [...scoped].sort((a, b) => Math.abs(b.latest) - Math.abs(a.latest)).slice(0, maxLimit);
+  applyPricePointsToSeries(sorted, requestedDate);
+  return {
+    ...payload,
+    series: sorted,
+    leaders: buildLeaders(scoped),
+    breakdown: buildBreakdown(scoped),
+    focusCandidates: buildFocusCandidates(payload.series)
+  };
+}
+
+async function prepareFilteredPayload(payload, scope, limit, waitMs, force = false, requestedDate = payload.requestedDate || formatDate(new Date()), focusNames = [], focusLimit = focusGroupLimit) {
+  const filtered = filterPayload(payload, scope, limit, requestedDate, focusNames, focusLimit);
+  if (scope === 'all' || scope === 'industry' || scope === 'concept') {
+    if (isHistoricalTradeDate(requestedDate)) {
+      const flowWaitMs = Math.max(8500, Math.floor(waitMs * 0.7));
+      const priceWaitMs = Math.max(2200, waitMs - flowWaitMs);
+      await hydrateVisibleHistoricalFlow(filtered.series, flowWaitMs, force, requestedDate);
+      markMissingHistoricalFlow(filtered.series, requestedDate);
+      await hydrateVisiblePricePoints(filtered.series, priceWaitMs, force, requestedDate);
+      applyPricePointsToSeries(filtered.series, requestedDate);
+      markMissingHistoricalPrice(filtered.series, requestedDate);
+      return finalizeFilteredPayload(filtered, limit);
+    }
+    const minuteWaitMs = Math.max(700, Math.floor(waitMs * 0.42));
+    const priceWaitMs = Math.max(700, waitMs - minuteWaitMs);
+    await hydrateVisibleMinutePoints(filtered.series, minuteWaitMs, force, requestedDate);
+    applyMinutePointsToSeries(filtered.series, requestedDate);
+    await hydrateVisiblePricePoints(filtered.series, priceWaitMs, force, requestedDate);
+    applyPricePointsToSeries(filtered.series, requestedDate);
+  }
+  return filtered;
+}
+
+function finalizeFilteredPayload(payload, limit) {
+  const scoped = Array.isArray(payload.series) ? payload.series : [];
+  const sorted = [...scoped]
+    .sort((a, b) => Math.abs(b.latest) - Math.abs(a.latest))
+    .slice(0, limit);
   return {
     ...payload,
     series: sorted,
@@ -1077,20 +1610,63 @@ function filterPayload(payload, scope, limit) {
   };
 }
 
-async function prepareFilteredPayload(payload, scope, limit, waitMs, force = false) {
-  const filtered = filterPayload(payload, scope, limit);
-  if (scope === 'all' || scope === 'industry' || scope === 'concept') {
-    const minuteWaitMs = Math.max(700, Math.floor(waitMs * 0.42));
-    const priceWaitMs = Math.max(700, waitMs - minuteWaitMs);
-    await hydrateVisibleMinutePoints(filtered.series, minuteWaitMs, force);
-    applyMinutePointsToSeries(filtered.series);
-    await hydrateVisiblePricePoints(filtered.series, priceWaitMs, force);
-    applyPricePointsToSeries(filtered.series);
+async function hydrateVisibleHistoricalFlow(series, waitMs = 3000, force = false, requestedDate = formatDate(new Date())) {
+  const candidates = series
+    .filter(item => item.sourceCode || item.code)
+    .filter(item => item.category === 'focus' || item.category === 'industry' || item.category === 'concept')
+    .map(item => ({
+      target: item,
+      query: {
+        ...item,
+        code: item.sourceCode || item.code,
+        market: item.sourceCode ? 90 : item.market,
+        name: item.sourceName || item.name,
+        category: item.sourceCategory || item.category
+      }
+    }))
+    .filter(({ query }) => query.code && query.market === 90);
+  if (!candidates.length) return;
+  const deadline = Date.now() + waitMs;
+  const batches = chunk(candidates, 8);
+  for (const batch of batches) {
+    if (Date.now() >= deadline) return;
+    const leftMs = deadline - Date.now();
+    await withTimeout(Promise.allSettled(batch.map(async ({ target, query }) => {
+      const snapshot = await withTimeout(emFundFlowDailySnapshot(query, force, requestedDate), Math.min(3200, leftMs)).catch(() => null);
+      if (!snapshot) return;
+      target.latest = snapshot.latest;
+      target.changePct = snapshot.changePct;
+      target.points = snapshot.points;
+      target.pointSource = 'daily';
+      target.rawBreakdown = snapshot.rawBreakdown;
+    })), leftMs).catch(() => null);
   }
-  return filtered;
 }
 
-async function hydrateVisibleMinutePoints(series, waitMs = 2500, force = false) {
+function markMissingHistoricalFlow(series, requestedDate) {
+  series.forEach(item => {
+    const hasTargetPoint = Array.isArray(item.points)
+      && item.points.some(point => point.date === requestedDate);
+    if (hasTargetPoint) return;
+    item.latest = 0;
+    item.points = [];
+    item.pointSource = 'missing';
+    item.rawBreakdown = { main: 0 };
+  });
+}
+
+function markMissingHistoricalPrice(series, requestedDate) {
+  series.forEach(item => {
+    const hasTargetPoints = Array.isArray(item.pricePoints)
+      && item.pricePoints.some(point => point.date === requestedDate);
+    if (hasTargetPoints) return;
+    item.pricePoints = [];
+    item.pricePointSource = 'missing';
+    item.changePct = 0;
+  });
+}
+
+async function hydrateVisibleMinutePoints(series, waitMs = 2500, force = false, requestedDate = formatDate(new Date())) {
   const missing = series
     .filter(item => item.sourceCode || item.code)
     .filter(item => item.category === 'focus' || item.category === 'industry' || item.category === 'concept')
@@ -1112,12 +1688,12 @@ async function hydrateVisibleMinutePoints(series, waitMs = 2500, force = false) 
     if (Date.now() >= deadline) return;
     const leftMs = deadline - Date.now();
     await withTimeout(Promise.allSettled(batch.map(item => (
-      withTimeout(emFundFlowMinutePoints(item, force), Math.min(900, leftMs)).catch(() => null)
+      withTimeout(emFundFlowMinutePoints(item, force, requestedDate), Math.min(900, leftMs)).catch(() => null)
     ))), leftMs).catch(() => null);
   }
 }
 
-async function hydrateVisiblePricePoints(series, waitMs = 3000, force = false) {
+async function hydrateVisiblePricePoints(series, waitMs = 3000, force = false, requestedDate = formatDate(new Date())) {
   const missing = series
     .filter(item => item.sourceCode || item.code)
     .filter(item => item.category === 'focus' || item.category === 'industry' || item.category === 'concept')
@@ -1139,14 +1715,40 @@ async function hydrateVisiblePricePoints(series, waitMs = 3000, force = false) {
     if (Date.now() >= deadline) return;
     const leftMs = deadline - Date.now();
     await withTimeout(Promise.allSettled(batch.map(item => (
-      withTimeout(emPriceTrendPoints(item, force), Math.min(900, leftMs)).catch(() => null)
+      withTimeout(emPriceTrendPoints(item, force, requestedDate), Math.min(isHistoricalTradeDate(requestedDate) ? 1600 : 900, leftMs)).catch(() => null)
     ))), leftMs).catch(() => null);
   }
 }
 
-function buildFocusSeries(series) {
+function buildFocusCandidates(series) {
+  const seen = new Set();
   const source = series.filter(item => item.category === 'industry' || item.category === 'concept');
-  const groups = focusGroups
+  return availableFocusGroups
+    .map(group => {
+      const selected = selectFocusRepresentative(group, source);
+      return {
+        name: group.name,
+        category: 'focus',
+        sourceName: selected?.name || '',
+        sourceCategory: selected?.category || '',
+        sourceCode: selected?.code || '',
+        sourceId: selected?.id || '',
+        latest: selected?.latest || 0,
+        changePct: selected?.changePct || 0
+      };
+    })
+    .filter(item => {
+      const key = normalizeBoardName(item.name);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 800);
+}
+
+function buildFocusSeries(series, focusNames = []) {
+  const source = series.filter(item => item.category === 'industry' || item.category === 'concept');
+  const groups = focusGroupsForRequest(focusNames)
     .map((group, index) => {
       const selected = selectFocusRepresentative(group, source);
       const focus = selected ? focusSeriesFromSelected(group, selected, index) : fallbackFocusSeries(group, index);
@@ -1155,6 +1757,26 @@ function buildFocusSeries(series) {
     })
     .filter(Boolean);
   return groups.length ? groups : source;
+}
+
+function focusGroupsForRequest(focusNames = []) {
+  const custom = Array.isArray(focusNames) && focusNames.length
+    ? focusNames.map(name => focusGroupFromName(name))
+    : defaultFocusGroups;
+  return custom;
+}
+
+function focusGroupFromName(name) {
+  const cleanName = normalizeFocusName(name);
+  const normalized = normalizeBoardName(cleanName);
+  const matchedDefault = availableFocusGroups.find(group => normalizeBoardName(group.name) === normalized);
+  if (matchedDefault) return { ...matchedDefault, name: cleanName || matchedDefault.name };
+  return {
+    key: `custom-${hashText(normalized || cleanName)}`,
+    name: cleanName,
+    preferred: [cleanName],
+    match: [cleanName]
+  };
 }
 
 function focusSeriesFromSelected(group, selected, index) {
@@ -1245,6 +1867,15 @@ function normalizeBoardName(name) {
     .replace(/[ⅠⅡⅢIV]+$/i, '')
     .replace(/概念|行业|板块/g, '')
     .trim();
+}
+
+function hashText(value) {
+  let hash = 0;
+  const text = String(value || '');
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36);
 }
 
 function normalizeFocusPoints(item) {
@@ -1561,6 +2192,19 @@ function tradingTimeline(date = new Date()) {
     session,
     isTradingTime: session === 'trading'
   };
+}
+
+function timelineForTradeDate(tradeDate = formatDate(new Date())) {
+  if (isHistoricalTradeDate(tradeDate)) {
+    return {
+      elapsed: tradingDayMinutes,
+      total: tradingDayMinutes,
+      endLabel: '15:00',
+      session: 'closed',
+      isTradingTime: false
+    };
+  }
+  return tradingTimeline();
 }
 
 function shanghaiTimeParts(date) {

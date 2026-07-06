@@ -2,10 +2,26 @@
   'use strict';
 
   const API_PATH = '/api/fund-flow/overview';
+  const FOCUS_GROUPS_PATH = '/api/fund-flow/focus-groups';
   const REQUEST_INTERVAL_MS = 8000;
   const REQUEST_TIMEOUT_MS = 6500;
-  const CLIENT_CACHE_KEY = 'a-share-fund-flow:last-overview:v2';
+  const HISTORICAL_REQUEST_TIMEOUT_MS = 22000;
+  const CLIENT_CACHE_KEY_PREFIX = 'a-share-fund-flow:last-overview:v3';
   const CLIENT_CACHE_MAX_AGE_MS = 20 * 60 * 1000;
+  const FOCUS_ITEM_CACHE_KEY_PREFIX = 'a-share-fund-flow:focus-item:v1';
+  const FOCUS_ITEM_CACHE_MAX_AGE_MS = 3 * 60 * 1000;
+  const HISTORICAL_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+  const HISTORICAL_TRADE_DATE_COUNT = 5;
+  const FOCUS_LIMIT = 31;
+  const FOCUS_STORAGE_KEY = 'a-share-fund-flow:focus-names:v1';
+  const FOCUS_UNLIMITED_STORAGE_KEY = 'a-share-fund-flow:focus-unlimited:v1';
+  const REPLAY_SECONDS_KEY = 'a-share-fund-flow:replay-seconds:v1';
+  const DEFAULT_FOCUS_NAMES = [
+    '有色金属', '人形机器人', '电力', '锂矿', '网络游戏', '煤炭', '创新药', '银行',
+    '电网设备', '白酒', 'AI应用', '化工', '光学光电子', '电力设备', '锂电池', '证券',
+    '半导体设备', 'MLCC', '商业航天', '储能', '消费电子', '玻璃基板', '液冷服务器',
+    '光纤', 'PCB', '算力租赁', '人工智能', 'CPO', '半导体', '存储芯片', '通信技术'
+  ];
   const POINT_COUNT = 48;
   const TRADING_DAY_MINUTES = 240;
   const CATEGORY_LABELS = {
@@ -28,10 +44,12 @@
     northbound: ['#ad3b3f', '#c86446', '#d3903a']
   };
   const POSITIVE_COLORS = ['#9f2e32', '#b93c39', '#cf5840', '#dc7447', '#c78927', '#a98d2b'];
+  const INITIAL_FOCUS_UNLIMITED = loadFocusUnlimited();
 
   const state = {
     data: null,
     selectedScope: 'all',
+    selectedDate: formatDate(new Date()),
     chartMode: 'flow',
     sortMode: 'absolute',
     paused: false,
@@ -40,13 +58,34 @@
     lastFetchAt: 0,
     nextFetchAt: 0,
     fetching: false,
+    pendingForceFetch: false,
     consecutiveErrors: 0,
     cacheLoaded: false,
+    focusNames: loadStoredFocusNames(INITIAL_FOCUS_UNLIMITED ? Infinity : FOCUS_LIMIT),
+    focusUnlimited: INITIAL_FOCUS_UNLIMITED,
+    focusPanelOpen: false,
+    focusCandidateList: [],
+    focusCandidateLoaded: false,
+    focusCandidateFetching: false,
+    focusSwapLoadingKey: '',
+    focusSwapRequestId: 0,
+    focusItemCache: new Map(),
     visibleSeries: [],
     plot: null,
     scrubMinute: null,
     scrubDragging: false,
-    scrubFrame: 0
+    scrubFrame: 0,
+    replaying: false,
+    replayFrame: 0,
+    replayStartedAt: 0,
+    replayLastFrameAt: 0,
+    replayDurationMs: loadReplaySeconds() * 1000,
+    replayLastMinute: -1,
+    recording: false,
+    recordChunks: [],
+    recordMediaRecorder: null,
+    recordStream: null,
+    recordFrameRate: 24
   };
 
   const els = {
@@ -68,15 +107,31 @@
     sort: document.getElementById('sortMode'),
     tabs: document.getElementById('scopeTabs'),
     mode: document.getElementById('chartMode'),
+    dateInput: document.getElementById('tradeDateInput'),
+    datePicker: document.getElementById('datePickerBtn'),
+    dateMenu: document.getElementById('dateMenu'),
+    dateToday: document.getElementById('dateTodayBtn'),
+    focusToggle: document.getElementById('focusToggleBtn'),
+    focusPanel: document.getElementById('focusPanel'),
+    focusCount: document.getElementById('focusCount'),
+    focusSearch: document.getElementById('focusSearch'),
+    focusCandidates: document.getElementById('focusCandidates'),
+    focusSelectAll: document.getElementById('focusSelectAllBtn'),
+    focusLimit: document.getElementById('focusLimitBtn'),
+    focusReset: document.getElementById('focusResetBtn'),
     timeTrack: document.getElementById('timeScrubTrack'),
     timeScale: document.querySelector('.time-scrubber-scale'),
     timeRange: document.getElementById('timeScrubRange'),
     timeLabel: document.getElementById('timeScrubLabel'),
-    timeNow: document.getElementById('timeNowBtn')
+    timeNow: document.getElementById('timeNowBtn'),
+    replaySeconds: document.getElementById('replaySeconds'),
+    replayBtn: document.getElementById('replayBtn'),
+    recordBtn: document.getElementById('recordBtn')
   };
   els.mobileStrip = document.getElementById('mobileBoardStrip');
 
   const ctx = els.canvas.getContext('2d');
+  let pointRowsFrameCache = null;
 
   function isCompactViewport() {
     return window.matchMedia('(max-width: 640px)').matches;
@@ -86,11 +141,101 @@
     return date.toLocaleTimeString('zh-CN', { hour12: false });
   }
 
+  function formatFileClock(date) {
+    const h = String(date.getHours()).padStart(2, '0');
+    const m = String(date.getMinutes()).padStart(2, '0');
+    const s = String(date.getSeconds()).padStart(2, '0');
+    return `${h}${m}${s}`;
+  }
+
   function formatDate(date) {
     const y = date.getFullYear();
     const m = String(date.getMonth() + 1).padStart(2, '0');
     const d = String(date.getDate()).padStart(2, '0');
     return `${y}-${m}-${d}`;
+  }
+
+  function todayDate() {
+    return formatDate(new Date());
+  }
+
+  function loadStoredFocusNames(limit = FOCUS_LIMIT) {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(FOCUS_STORAGE_KEY) || '[]');
+      const names = normalizeFocusNames(parsed, limit);
+      return names.length ? names : DEFAULT_FOCUS_NAMES.slice();
+    } catch {
+      return DEFAULT_FOCUS_NAMES.slice();
+    }
+  }
+
+  function saveFocusNames() {
+    try {
+      localStorage.setItem(FOCUS_STORAGE_KEY, JSON.stringify(state.focusNames));
+    } catch {
+      // Local preferences are optional.
+    }
+  }
+
+  function loadFocusUnlimited() {
+    try {
+      return localStorage.getItem(FOCUS_UNLIMITED_STORAGE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  function saveFocusUnlimited() {
+    try {
+      localStorage.setItem(FOCUS_UNLIMITED_STORAGE_KEY, state.focusUnlimited ? '1' : '0');
+    } catch {
+      // Local preferences are optional.
+    }
+  }
+
+  async function fetchFocusCandidates() {
+    if (state.focusCandidateLoaded || state.focusCandidateFetching) return;
+    state.focusCandidateFetching = true;
+    try {
+      const res = await fetch(FOCUS_GROUPS_PATH, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const candidates = normalizeFocusCandidates(data.focusCandidates);
+      if (candidates.length) {
+        state.focusCandidateList = candidates;
+        state.focusCandidateLoaded = true;
+        if (state.focusPanelOpen) updateFocusManager();
+      }
+    } catch {
+      // The overview payload also carries candidates; keep the UI usable with that.
+    } finally {
+      state.focusCandidateFetching = false;
+    }
+  }
+
+  function loadReplaySeconds() {
+    const value = Number(localStorage.getItem(REPLAY_SECONDS_KEY));
+    return clamp(Number.isFinite(value) ? value : 30, 10, 600);
+  }
+
+  function saveReplaySeconds(seconds) {
+    try {
+      localStorage.setItem(REPLAY_SECONDS_KEY, String(clamp(Number(seconds) || 30, 10, 600)));
+    } catch {
+      // Local preferences are optional.
+    }
+  }
+
+  function isHistoricalDate() {
+    return state.selectedDate !== todayDate();
+  }
+
+  function clientCacheKey(date = state.selectedDate) {
+    return `${CLIENT_CACHE_KEY_PREFIX}:${date || todayDate()}:${focusCacheKey()}`;
+  }
+
+  function shouldUseClientCache(date = state.selectedDate) {
+    return normalizeSelectedDate(date) !== todayDate();
   }
 
   function formatMoney(value, signed = true) {
@@ -150,8 +295,12 @@
   function requestUrl(force = false) {
     const params = new URLSearchParams({
       scope: state.selectedScope,
-      limit: '60'
+      limit: '60',
+      date: state.selectedDate || todayDate()
     });
+    const focusParam = focusNamesForRequest();
+    if (focusParam) params.set('focus', focusParam);
+    if (state.focusUnlimited) params.set('focusLimit', 'all');
     if (force) {
       params.set('force', '1');
       params.set('t', String(Date.now()));
@@ -159,17 +308,33 @@
     return `${API_PATH}?${params.toString()}`;
   }
 
+  function focusNamesForRequest() {
+    const names = normalizeFocusNames(state.focusNames, focusSelectionLimit());
+    return sameFocusNames(names, DEFAULT_FOCUS_NAMES) ? '' : names.join(',');
+  }
+
+  function focusCacheKey() {
+    const names = normalizeFocusNames(state.focusNames, focusSelectionLimit());
+    const limitKey = state.focusUnlimited ? 'all' : '31';
+    return sameFocusNames(names, DEFAULT_FOCUS_NAMES) ? `default:${limitKey}` : `${limitKey}:${names.map(normalizeBoardName).join('|')}`;
+  }
+
   async function fetchData(force) {
     const now = Date.now();
-    if (state.fetching) return;
+    if (state.fetching) {
+      if (force) state.pendingForceFetch = true;
+      return;
+    }
     if (!force && document.hidden) return;
     if (!force && state.paused) return;
+    if (!force && isHistoricalDate() && state.data?.requestedDate === state.selectedDate) return;
     if (!force && now < state.nextFetchAt) return;
     state.fetching = true;
     updateRefreshButton();
     setStatus('loading', '请求中');
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), force ? REQUEST_TIMEOUT_MS + 3500 : REQUEST_TIMEOUT_MS);
+    const timeoutMs = isHistoricalDate() ? HISTORICAL_REQUEST_TIMEOUT_MS : (force ? REQUEST_TIMEOUT_MS + 3500 : REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const res = await fetch(requestUrl(force), { cache: 'no-store', signal: controller.signal });
@@ -201,16 +366,23 @@
       clearTimeout(timeout);
       state.fetching = false;
       updateRefreshButton();
+      if (state.pendingForceFetch) {
+        state.pendingForceFetch = false;
+        fetchData(true);
+      }
     }
   }
 
   function applyData(data) {
-    state.data = normalizeClientData(data);
+    const normalized = normalizeClientData(data);
+    if (normalized.requestedDate && normalized.requestedDate !== state.selectedDate) return;
+    state.data = normalized;
     state.hoverId = null;
     renderAll();
   }
 
   function loadCachedDataOnBoot() {
+    if (!shouldUseClientCache()) return false;
     const cached = loadClientCache();
     if (!cached) return false;
     applyData(markCachedData(cached.data, '正在后台更新，先显示上次可用数据。'));
@@ -219,11 +391,13 @@
   }
 
   function loadClientCache() {
+    if (!shouldUseClientCache()) return null;
     try {
-      const raw = localStorage.getItem(CLIENT_CACHE_KEY);
+      const raw = localStorage.getItem(clientCacheKey());
       if (!raw) return null;
       const cached = JSON.parse(raw);
-      if (!cached?.data?.series?.length || Date.now() - Number(cached.savedAt || 0) > CLIENT_CACHE_MAX_AGE_MS) return null;
+      const maxAge = isHistoricalDate() ? HISTORICAL_CACHE_MAX_AGE_MS : CLIENT_CACHE_MAX_AGE_MS;
+      if (!cached?.data?.series?.length || Date.now() - Number(cached.savedAt || 0) > maxAge) return null;
       return cached;
     } catch {
       return null;
@@ -232,8 +406,10 @@
 
   function saveClientCache(data) {
     if (!data?.series?.length) return;
+    const cacheDate = data.requestedDate || state.selectedDate;
+    if (!shouldUseClientCache(cacheDate)) return;
     try {
-      localStorage.setItem(CLIENT_CACHE_KEY, JSON.stringify({ savedAt: Date.now(), data }));
+      localStorage.setItem(clientCacheKey(cacheDate), JSON.stringify({ savedAt: Date.now(), data }));
     } catch {
       // Storage may be unavailable in private browsing.
     }
@@ -262,25 +438,46 @@
     const series = source.series.map((item, index) => {
       const latest = Number(item.latest) || 0;
       const category = item.category || 'industry';
-      const rawPoints = Array.isArray(item.points) && item.points.length
+      const missingFlowPoints = item.pointSource === 'missing';
+      const rawPoints = !missingFlowPoints && Array.isArray(item.points) && item.points.length
         ? item.points.map((point, pointIndex) => ({
             time: point.time || timeLabel(pointIndex, item.points.length, timeline.elapsed),
-            value: Number(point.value) || 0
+            value: Number(point.value) || 0,
+            date: point.date
           }))
-        : [{ time: minuteToTimeLabel(timeline.elapsed), value: latest }];
-      const rawPricePoints = Array.isArray(item.pricePoints) && item.pricePoints.length
+        : [];
+      const missingPricePoints = item.pricePointSource === 'missing';
+      const rawPricePoints = !missingPricePoints && Array.isArray(item.pricePoints) && item.pricePoints.length
         ? item.pricePoints.map(point => ({
             time: point.time,
             value: Number(point.value) || 0,
             price: Number(point.price) || 0
           }))
-        : [{ time: minuteToTimeLabel(timeline.elapsed), value: Number(item.changePct) || 0 }];
-      const pricePoints = normalizeSeriesPoints(rawPricePoints, Number(item.changePct) || 0, timeline, 'price', item.pricePointSource || 'fallback');
-      const pricePointSource = item.pricePointSource || ((Array.isArray(item.pricePoints) && item.pricePoints.length > 10) ? 'minute' : 'fallback');
-      const hasRealFlowLine = item.pointSource === 'minute' && rawPoints.length > 1;
-      const points = hasRealFlowLine
-        ? normalizeSeriesPoints(rawPoints, latest, timeline, 'flow', 'minute')
-        : normalizeSeriesPoints(rawPoints, latest, timeline, 'flow', item.pointSource || 'snapshot');
+        : [];
+      const pricePoints = missingPricePoints
+        ? []
+        : normalizeSeriesPoints(
+          rawPricePoints.length ? rawPricePoints : [{ time: minuteToTimeLabel(timeline.elapsed), value: Number(item.changePct) || 0 }],
+          Number(item.changePct) || 0,
+          timeline,
+          'price',
+          item.pricePointSource || 'fallback'
+        );
+      const pricePointSource = missingPricePoints
+        ? 'missing'
+        : (item.pricePointSource || ((Array.isArray(item.pricePoints) && item.pricePoints.length > 10) ? 'minute' : 'fallback'));
+      const hasRealFlowLine = isTimelineSource(item.pointSource, 'flow') && rawPoints.length > 1;
+      const points = missingFlowPoints
+        ? []
+        : hasRealFlowLine
+        ? normalizeSeriesPoints(rawPoints, latest, timeline, 'flow', item.pointSource)
+        : normalizeSeriesPoints(
+          rawPoints.length ? rawPoints : [{ time: minuteToTimeLabel(timeline.elapsed), value: latest }],
+          latest,
+          timeline,
+          'flow',
+          item.pointSource || 'snapshot'
+        );
       return {
         id: item.id || `${category}-${index}`,
         name: item.name || `资金流${index + 1}`,
@@ -288,7 +485,7 @@
         sourceName: item.sourceName || '',
         sourceCategory: item.sourceCategory || '',
         sourceCode: item.sourceCode || '',
-        pointSource: hasRealFlowLine ? 'minute' : (item.pointSource || 'snapshot'),
+        pointSource: missingFlowPoints ? 'missing' : (hasRealFlowLine ? item.pointSource : (item.pointSource || 'snapshot')),
         pricePointSource,
         latest,
         rank: Number(item.rank) || index + 1,
@@ -301,10 +498,12 @@
     return {
       updatedAt: source.updatedAt || new Date().toISOString(),
       tradeDate: source.tradeDate || formatDate(new Date()),
+      requestedDate: source.requestedDate || source.tradeDate || state.selectedDate || todayDate(),
       sourceStatus: source.sourceStatus || { level: 'error', text: '真实源不可用', detail: '未连接真实数据源' },
       refreshAfterMs: source.refreshAfterMs || REQUEST_INTERVAL_MS,
       timeline,
       series,
+      focusCandidates: normalizeFocusCandidates(source.focusCandidates),
       leaders: source.leaders || buildLeaders(series),
       breakdown: Array.isArray(source.breakdown) && source.breakdown.length ? source.breakdown : buildBreakdown(series),
       note: source.note || ''
@@ -313,10 +512,14 @@
 
   function renderAll() {
     updateHeader();
+    updateDateControls();
+    updateFocusManager();
     updateStatus();
     updateLists();
     updateMobileStrip();
     updateTimeScrubber();
+    updateReplayControls();
+    updateRecordControls();
     drawChart();
   }
 
@@ -330,9 +533,16 @@
     const viewingLabel = minuteToTimeLabel(viewingMinute);
     const visible = currentSeries();
     const minuteCount = visible.filter(item => item.pointSource === 'minute').length;
+    const dailyFlowCount = visible.filter(item => item.pointSource === 'daily').length;
+    const storedFlowCount = visible.filter(item => item.pointSource === 'stored').length;
+    const flowDataCount = visible.filter(item => item.pointSource === 'minute' || item.pointSource === 'daily' || item.pointSource === 'stored').length;
     const priceTrendCount = visible.filter(item => (item.pricePoints || []).length > 10).length;
     const flowMode = minuteCount === visible.length && visible.length
       ? '资金分钟线'
+      : storedFlowCount && isHistoricalDate()
+        ? '本地存档走势'
+      : dailyFlowCount && isHistoricalDate()
+        ? '历史日资金净额'
       : minuteCount
         ? '资金分钟线/实时净额'
         : '资金实时净额';
@@ -346,12 +556,359 @@
         : flowMode;
     const unit = state.chartMode === 'dual' ? '亿元 / %' : state.chartMode === 'price' ? '%' : '亿元';
     const countText = visible.length
-      ? `显示 ${visible.length} 条 · 真实资金分钟线 ${minuteCount}/${visible.length} · 分时 ${priceTrendCount}/${visible.length}`
+      ? `显示 ${visible.length} 条 · 资金数据 ${flowDataCount}/${visible.length} · 分时 ${priceTrendCount}/${visible.length}`
       : '等待数据';
     const replayText = state.scrubMinute === null ? `至${endLabel}` : `回看 ${viewingLabel}`;
+    const dateText = isHistoricalDate() ? `回溯 ${state.selectedDate}` : '今日实时';
     els.subtitle.textContent = isCompactViewport() && visible.length
-      ? `${scopeLabel} ${visible.length}条 · 资金${minuteCount}/${visible.length} · ${replayText}`
-      : `${scopeLabel} · ${countText} · ${mode} · 09:30 至 ${endLabel} · ${state.scrubMinute === null ? '当前' : `回看 ${viewingLabel}`} · 单位：${unit}`;
+      ? `${scopeLabel} ${visible.length}条 · ${dateText} · 资金${flowDataCount}/${visible.length} · ${replayText}`
+      : `${scopeLabel} · ${dateText} · ${countText} · ${mode} · 09:30 至 ${endLabel} · ${state.scrubMinute === null ? '当前' : `回看 ${viewingLabel}`} · 单位：${unit}`;
+  }
+
+  function updateDateControls() {
+    if (!els.dateInput) return;
+    const dates = recentTradeDates();
+    els.dateInput.value = state.selectedDate || dates[0] || todayDate();
+    els.dateInput.max = dates[0] || todayDate();
+    els.dateInput.min = dates[dates.length - 1] || todayDate();
+    els.dateToday?.classList.toggle('active', !isHistoricalDate());
+    renderDateMenu(dates);
+  }
+
+  function recentTradeDates() {
+    const result = [];
+    const cursor = new Date();
+    while (result.length < HISTORICAL_TRADE_DATE_COUNT) {
+      const day = cursor.getDay();
+      if (day !== 0 && day !== 6) result.push(formatDate(cursor));
+      cursor.setDate(cursor.getDate() - 1);
+    }
+    return result;
+  }
+
+  function renderDateMenu(dates) {
+    if (!els.dateMenu) return;
+    els.dateMenu.innerHTML = dates.map(date => `
+      <button class="${date === state.selectedDate ? 'active' : ''}" type="button" data-date="${escapeHtml(date)}">
+        <span>${escapeHtml(date.replace(/-/g, '/'))}</span>
+        <small>${date === todayDate() ? '今日' : '回溯'}</small>
+      </button>
+    `).join('');
+  }
+
+  function updateFocusManager() {
+    if (!els.focusPanel) return;
+    const candidateCount = mergedFocusCandidates().length;
+    els.focusPanel.hidden = !state.focusPanelOpen;
+    els.focusToggle?.classList.toggle('active', state.focusPanelOpen);
+    if (els.focusCount) {
+      const limitText = state.focusUnlimited ? '不限' : FOCUS_LIMIT;
+      els.focusCount.textContent = `${state.focusNames.length}/${limitText} · 全部${candidateCount}`;
+    }
+    if (els.focusLimit) {
+      els.focusLimit.textContent = state.focusUnlimited ? '限制31' : '解除限制';
+      els.focusLimit.classList.toggle('active', state.focusUnlimited);
+    }
+    if (els.focusSelectAll) {
+      const allCount = mergedFocusCandidates().length;
+      const selectedCount = normalizeFocusNames(state.focusNames, Infinity).length;
+      els.focusSelectAll.hidden = !state.focusUnlimited;
+      els.focusSelectAll.disabled = !state.focusUnlimited || !allCount || selectedCount >= allCount;
+      els.focusSelectAll.textContent = selectedCount >= allCount && allCount ? '已全选' : '全选';
+    }
+    renderFocusCandidates();
+  }
+
+  function renderFocusCandidates() {
+    if (!els.focusCandidates) return;
+    const query = normalizeBoardName(normalizeFocusName(els.focusSearch?.value || ''));
+    const selected = new Set(state.focusNames.map(normalizeBoardName));
+    const candidates = mergedFocusCandidates()
+      .filter(item => !query || fuzzyIncludes(item.name, query) || fuzzyIncludes(item.sourceName, query));
+    const rows = candidates.map(item => candidateButton(item, selected.has(normalizeBoardName(item.name))));
+    els.focusCandidates.innerHTML = rows.join('') || '<span class="empty-inline">暂无匹配</span>';
+  }
+
+  function mergedFocusCandidates() {
+    const seen = new Set();
+    const items = [];
+    const addOrUpdate = item => {
+      const name = normalizeFocusName(item?.name);
+      const key = normalizeBoardName(name);
+      if (!key) return;
+      const next = {
+        name,
+        category: item.category || 'focus',
+        sourceName: normalizeFocusName(item.sourceName),
+        sourceCategory: item.sourceCategory || '',
+        sourceCode: item.sourceCode || '',
+        latest: Number(item.latest) || 0,
+        changePct: Number(item.changePct) || 0
+      };
+      const existing = items.find(candidate => normalizeBoardName(candidate.name) === key);
+      if (existing) {
+        existing.category = next.category || existing.category;
+        existing.sourceName = next.sourceName || existing.sourceName;
+        existing.sourceCategory = next.sourceCategory || existing.sourceCategory;
+        existing.sourceCode = next.sourceCode || existing.sourceCode;
+        existing.latest = next.latest || existing.latest;
+        existing.changePct = next.changePct || existing.changePct;
+        return;
+      }
+      seen.add(key);
+      items.push(next);
+    };
+    state.focusCandidateList.forEach(addOrUpdate);
+    (state.data?.focusCandidates || []).forEach(addOrUpdate);
+    state.focusNames.forEach(name => addOrUpdate({ name, category: 'focus' }));
+    return items;
+  }
+
+  function candidateButton(item, selected) {
+    const loading = state.focusSwapLoadingKey === normalizeBoardName(item.name);
+    const disabled = !selected && !state.focusUnlimited && state.focusNames.length >= FOCUS_LIMIT;
+    const category = '大类';
+    const value = Number(item.latest) ? formatMoney(item.latest) : '';
+    const source = item.sourceName && normalizeBoardName(item.sourceName) !== normalizeBoardName(item.name)
+      ? item.sourceName
+      : '';
+    const stateText = loading ? '加载中' : selected ? '已选' : disabled ? '已满' : category;
+    const meta = [stateText, source, value].filter(Boolean).join(' ');
+    return `
+      <button class="candidate-chip${selected ? ' active' : ''}" type="button" data-toggle-focus="${escapeHtml(item.name)}" aria-pressed="${selected ? 'true' : 'false'}"${disabled ? ' disabled' : ''}>
+        <span class="candidate-name">${escapeHtml(item.name)}</span>
+        <span class="candidate-meta">${escapeHtml(meta)}</span>
+      </button>
+    `;
+  }
+
+  async function toggleFocusName(name) {
+    const normalized = normalizeFocusName(name);
+    if (!normalized) return;
+    const target = normalizeBoardName(normalized);
+    const exists = state.focusNames.find(item => normalizeBoardName(item) === target);
+    if (exists) {
+      removeFocusName(normalized);
+      return;
+    }
+    await addFocusName(normalized);
+  }
+
+  async function addFocusName(name) {
+    if (!state.focusUnlimited && state.focusNames.length >= FOCUS_LIMIT) return;
+    const key = normalizeBoardName(name);
+    const requestId = state.focusSwapRequestId + 1;
+    state.focusSwapRequestId = requestId;
+    state.focusSwapLoadingKey = key;
+    updateFocusManager();
+    try {
+      const item = await loadFocusSeriesItem(name);
+      if (requestId !== state.focusSwapRequestId) return;
+      state.focusNames = normalizeFocusNames([...state.focusNames, name], focusSelectionLimit());
+      state.focusPanelOpen = true;
+      saveFocusNames();
+      applyFocusSeriesAdd(item, name);
+      state.focusSwapLoadingKey = '';
+      updateFocusManager();
+    } catch (err) {
+      if (state.data) {
+        state.data.sourceStatus = {
+          ...(state.data.sourceStatus || {}),
+          level: 'warn',
+          text: '添加失败',
+          detail: `大类 ${name} 暂时没有取得数据：${err?.message || '请求失败'}`
+        };
+        renderAll();
+      }
+      state.focusSwapLoadingKey = '';
+      updateFocusManager();
+    }
+  }
+
+  function removeFocusName(name) {
+    if (state.focusNames.length <= 1) return;
+    const key = normalizeBoardName(name);
+    state.focusNames = state.focusNames.filter(item => normalizeBoardName(item) !== key);
+    state.focusPanelOpen = true;
+    saveFocusNames();
+    applyFocusSeriesRemove(key);
+    updateFocusManager();
+  }
+
+  async function loadFocusSeriesItem(name) {
+    const cached = loadFocusItemCache(name);
+    if (cached) return cached;
+    const controller = new AbortController();
+    const timeoutMs = isHistoricalDate() ? HISTORICAL_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS + 3500;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(singleFocusUrl(name), { cache: 'no-store', signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const normalized = normalizeClientData(data);
+      const item = normalized.series.find(seriesItem => normalizeBoardName(seriesItem.name) === normalizeBoardName(name)) || normalized.series[0];
+      if (!item) throw new Error('无可用大类数据');
+      if (state.data && normalized.focusCandidates.length > state.data.focusCandidates.length) {
+        state.data.focusCandidates = normalized.focusCandidates;
+      }
+      saveFocusItemCache(name, item);
+      return cloneSeriesItem(item);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  function singleFocusUrl(name) {
+    const params = new URLSearchParams({
+      scope: 'all',
+      limit: '60',
+      date: state.selectedDate || todayDate(),
+      focus: name,
+      single: '1'
+    });
+    return `${API_PATH}?${params.toString()}`;
+  }
+
+  function applyFocusSeriesAdd(item, name) {
+    if (!state.data) {
+      fetchData(true);
+      return;
+    }
+    const series = state.focusUnlimited ? state.data.series.slice() : state.data.series.slice(0, FOCUS_LIMIT);
+    const nextItem = {
+      ...cloneSeriesItem(item),
+      name,
+      category: 'focus',
+      rank: series.length + 1
+    };
+    series.push(nextItem);
+    state.data = {
+      ...state.data,
+      updatedAt: new Date().toISOString(),
+      series,
+      leaders: buildLeaders(series),
+      breakdown: buildBreakdown(series),
+      sourceStatus: {
+        ...(state.data.sourceStatus || {}),
+        level: 'live',
+        text: '真实数据',
+        detail: `已添加大类 ${name}；相同大类会优先使用本机缓存。`
+      }
+    };
+    state.hoverId = null;
+    state.lockedId = null;
+    renderAll();
+  }
+
+  function applyFocusSeriesRemove(key) {
+    if (!state.data) return;
+    const series = state.data.series
+      .filter(item => normalizeBoardName(item.name) !== key)
+      .map((item, index) => ({ ...item, rank: index + 1 }));
+    state.data = {
+      ...state.data,
+      updatedAt: new Date().toISOString(),
+      series,
+      leaders: buildLeaders(series),
+      breakdown: buildBreakdown(series),
+      sourceStatus: {
+        ...(state.data.sourceStatus || {}),
+        level: 'live',
+        text: '真实数据',
+        detail: `已取消大类 ${key}。`
+      }
+    };
+    if (state.lockedId && !series.some(item => item.id === state.lockedId)) state.lockedId = null;
+    renderAll();
+  }
+
+  function toggleFocusUnlimited() {
+    state.focusUnlimited = !state.focusUnlimited;
+    if (!state.focusUnlimited && state.focusNames.length > FOCUS_LIMIT) {
+      state.focusNames = normalizeFocusNames(state.focusNames, FOCUS_LIMIT);
+      saveFocusUnlimited();
+      persistFocusAndReload();
+      return;
+    }
+    saveFocusUnlimited();
+    saveFocusNames();
+    updateFocusManager();
+    if (state.focusUnlimited) {
+      state.nextFetchAt = 0;
+      fetchData(true);
+    }
+  }
+
+  async function selectAllFocusNames() {
+    if (!state.focusUnlimited) return;
+    await fetchFocusCandidates();
+    const names = mergedFocusCandidates().map(item => item.name);
+    if (!names.length) return;
+    state.focusNames = normalizeFocusNames(names, Infinity);
+    state.focusPanelOpen = true;
+    saveFocusNames();
+    persistFocusAndReload();
+  }
+
+  function focusSelectionLimit() {
+    return state.focusUnlimited ? Infinity : FOCUS_LIMIT;
+  }
+
+  function loadFocusItemCache(name) {
+    const key = focusItemCacheKey(name);
+    const cached = state.focusItemCache.get(key) || readStoredFocusItemCache(key);
+    if (!cached?.item || Date.now() - Number(cached.savedAt || 0) > focusItemCacheMaxAge()) return null;
+    state.focusItemCache.set(key, cached);
+    return cloneSeriesItem(cached.item);
+  }
+
+  function saveFocusItemCache(name, item) {
+    const key = focusItemCacheKey(name);
+    const cached = { savedAt: Date.now(), item: cloneSeriesItem(item) };
+    state.focusItemCache.set(key, cached);
+    try {
+      localStorage.setItem(key, JSON.stringify(cached));
+    } catch {
+      // Local cache is optional.
+    }
+  }
+
+  function readStoredFocusItemCache(key) {
+    try {
+      return JSON.parse(localStorage.getItem(key) || 'null');
+    } catch {
+      return null;
+    }
+  }
+
+  function focusItemCacheKey(name) {
+    return `${FOCUS_ITEM_CACHE_KEY_PREFIX}:${state.selectedDate || todayDate()}:${normalizeBoardName(name)}`;
+  }
+
+  function focusItemCacheMaxAge() {
+    return isHistoricalDate() ? HISTORICAL_CACHE_MAX_AGE_MS : FOCUS_ITEM_CACHE_MAX_AGE_MS;
+  }
+
+  function cloneSeriesItem(item) {
+    return {
+      ...item,
+      points: Array.isArray(item.points) ? item.points.map(point => ({ ...point })) : [],
+      pricePoints: Array.isArray(item.pricePoints) ? item.pricePoints.map(point => ({ ...point })) : []
+    };
+  }
+
+  function resetFocusNames() {
+    state.focusSwapLoadingKey = '';
+    state.focusNames = DEFAULT_FOCUS_NAMES.slice(0, FOCUS_LIMIT);
+    persistFocusAndReload();
+  }
+
+  function persistFocusAndReload() {
+    saveFocusNames();
+    stopReplay(false);
+    state.nextFetchAt = 0;
+    applyData(createEmptyData('正在按新的重点大类查询真实资金数据。'));
+    fetchData(true);
   }
 
   function setStatus(level, text) {
@@ -365,19 +922,24 @@
     setStatus(level, source.text || '未知');
     const visible = currentSeries();
     const minuteCount = visible.filter(item => item.pointSource === 'minute').length;
+    const dailyFlowCount = visible.filter(item => item.pointSource === 'daily').length;
+    const storedFlowCount = visible.filter(item => item.pointSource === 'stored').length;
     const detail = source.detail || state.data?.note || 'UI 每秒心跳，真实请求分层限流。';
     const priceTrendCount = visible.filter(item => item.pricePointSource === 'minute' || (item.pricePoints || []).length > 10).length;
     const minuteHint = visible.length
-      ? `当前显示全部 ${visible.length} 条重点大类；真实资金分钟线 ${minuteCount}/${visible.length}，涨跌幅真实分时 ${priceTrendCount}/${visible.length}。`
+      ? `当前显示全部 ${visible.length} 条重点大类；真实资金分钟线 ${minuteCount}/${visible.length}，本地存档走势 ${storedFlowCount}/${visible.length}，历史日资金净额 ${dailyFlowCount}/${visible.length}，涨跌幅真实分时 ${priceTrendCount}/${visible.length}。`
       : '';
-    els.notice.innerHTML = `<strong>数据说明</strong><p>${escapeHtml(`${detail}${minuteHint ? ` ${minuteHint}` : ''}`)}</p>`;
+    const historyHint = isHistoricalDate()
+      ? ` 正在回溯 ${state.selectedDate}；资金图展示目标日真实资金净额，分钟线缺失时显示 15:00 日资金快照。`
+      : '';
+    els.notice.innerHTML = `<strong>数据说明</strong><p>${escapeHtml(`${detail}${minuteHint ? ` ${minuteHint}` : ''}${historyHint}`)}</p>`;
     updateRefreshButton();
   }
 
   function updateRefreshButton() {
     if (!els.refresh) return;
     els.refresh.disabled = state.fetching;
-    els.refresh.textContent = state.fetching ? '更新中' : '更新数据';
+    els.refresh.textContent = state.fetching ? '更新中' : (isHistoricalDate() ? '查询日期' : '更新数据');
   }
 
   function updateLists() {
@@ -423,15 +985,17 @@
   }
 
   function setScrubMinute(minute) {
+    stopReplay(false);
     const maxMinute = availableEndMinute();
     const next = clamp(Math.round(Number(minute) || 0), 0, maxMinute);
     state.scrubMinute = next >= maxMinute ? null : next;
     renderAll();
   }
 
-  function setScrubMinuteFast(minute) {
+  function setScrubMinuteFast(minute, smooth = false) {
     const maxMinute = availableEndMinute();
-    const next = clamp(Math.round(Number(minute) || 0), 0, maxMinute);
+    const raw = Number(minute) || 0;
+    const next = clamp(smooth ? raw : Math.round(raw), 0, maxMinute);
     state.scrubMinute = next >= maxMinute ? null : next;
     if (state.scrubFrame) return;
     state.scrubFrame = requestAnimationFrame(() => {
@@ -440,6 +1004,183 @@
       updateHeader();
       drawChart();
     });
+  }
+
+  function updateReplayControls() {
+    if (!els.replayBtn || !els.replaySeconds) return;
+    const seconds = Math.round(state.replayDurationMs / 1000);
+    if (document.activeElement !== els.replaySeconds) els.replaySeconds.value = String(seconds);
+    els.replayBtn.textContent = state.replaying ? '停止' : '播放';
+    els.replayBtn.classList.toggle('active', state.replaying);
+    els.replayBtn.disabled = !state.data || availableEndMinute() <= 0;
+  }
+
+  function canRecordCanvas() {
+    return Boolean(els.canvas?.captureStream && window.MediaRecorder);
+  }
+
+  function preferredRecordMimeType() {
+    const candidates = [
+      'video/mp4;codecs="avc1.42E01E"',
+      'video/mp4;codecs=avc1.42E01E',
+      'video/mp4;codecs=avc1.4D002A',
+      'video/mp4;codecs=avc1.640028',
+      'video/mp4;codecs=h264',
+      'video/mp4',
+      'video/webm;codecs=vp8',
+      'video/webm;codecs=vp9',
+      'video/webm'
+    ];
+    return candidates.find(type => window.MediaRecorder.isTypeSupported?.(type)) || '';
+  }
+
+  function recordVideoBitsPerSecond() {
+    const pixels = Math.max(1, els.canvas.width * els.canvas.height);
+    const seriesCount = visibleSeriesCount();
+    const perPixel = state.recordFrameRate >= 24 ? 6 : 5;
+    const maxBitrate = seriesCount > 60 ? 12_000_000 : 16_000_000;
+    return clamp(Math.round(pixels * perPixel), 4_000_000, maxBitrate);
+  }
+
+  function recordingFrameRate() {
+    const seriesCount = visibleSeriesCount();
+    if (seriesCount > 120) return 16;
+    if (seriesCount > 60) return 20;
+    return 24;
+  }
+
+  function replayFrameRate() {
+    const seriesCount = visibleSeriesCount();
+    if (state.recording) return recordingFrameRate();
+    if (seriesCount > 120) return 20;
+    if (seriesCount > 60) return 24;
+    return 30;
+  }
+
+  function visibleSeriesCount() {
+    return state.visibleSeries?.length || currentSeries().length;
+  }
+
+  function recordFileExtension(mimeType) {
+    return String(mimeType || '').toLowerCase().includes('mp4') ? 'mp4' : 'webm';
+  }
+
+  function updateRecordControls() {
+    if (!els.recordBtn) return;
+    const supported = canRecordCanvas();
+    els.recordBtn.textContent = supported ? (state.recording ? '停止' : '录制') : '不可用';
+    els.recordBtn.classList.toggle('active', state.recording);
+    els.recordBtn.disabled = !supported;
+  }
+
+  function startCanvasRecording() {
+    if (state.recording || !canRecordCanvas()) return;
+    try {
+      drawChart();
+      state.recordFrameRate = recordingFrameRate();
+      const stream = els.canvas.captureStream(state.recordFrameRate);
+      const mimeType = preferredRecordMimeType();
+      const recorderOptions = { videoBitsPerSecond: recordVideoBitsPerSecond() };
+      if (mimeType) recorderOptions.mimeType = mimeType;
+      const recorder = new window.MediaRecorder(stream, recorderOptions);
+      state.recordChunks = [];
+      state.recordStream = stream;
+      state.recordMediaRecorder = recorder;
+      recorder.ondataavailable = event => {
+        if (event.data?.size) state.recordChunks.push(event.data);
+      };
+      recorder.onstop = saveCanvasRecording;
+      recorder.onerror = () => {
+        state.recording = false;
+        cleanupCanvasRecording();
+        updateRecordControls();
+      };
+      recorder.start(1000);
+      state.recording = true;
+    } catch {
+      state.recording = false;
+      cleanupCanvasRecording();
+    }
+    updateRecordControls();
+  }
+
+  function stopCanvasRecording() {
+    const recorder = state.recordMediaRecorder;
+    if (!state.recording || !recorder) return;
+    state.recording = false;
+    updateRecordControls();
+    if (recorder.state !== 'inactive') recorder.stop();
+  }
+
+  function cleanupCanvasRecording() {
+    state.recordStream?.getTracks?.().forEach(track => track.stop());
+    state.recordStream = null;
+    state.recordMediaRecorder = null;
+    state.recordChunks = [];
+  }
+
+  function saveCanvasRecording() {
+    const recorder = state.recordMediaRecorder;
+    const chunks = state.recordChunks;
+    const mimeType = recorder?.mimeType || chunks[0]?.type || 'video/webm';
+    const blob = new Blob(chunks, { type: mimeType });
+    cleanupCanvasRecording();
+    if (!blob.size) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `a-share-canvas-${state.selectedDate || todayDate()}-${formatFileClock(new Date())}.${recordFileExtension(mimeType)}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+
+  function startReplay(seconds) {
+    const maxMinute = availableEndMinute();
+    if (!state.data || maxMinute <= 0) return;
+    stopReplay(false);
+    const safeSeconds = clamp(Number(seconds) || 30, 10, 600);
+    state.replayDurationMs = safeSeconds * 1000;
+    state.replaying = true;
+    state.replayStartedAt = performance.now();
+    state.replayLastFrameAt = 0;
+    state.replayLastMinute = -1;
+    state.scrubMinute = 0;
+    saveReplaySeconds(safeSeconds);
+    stepReplay(state.replayStartedAt);
+  }
+
+  function stepReplay(now) {
+    if (!state.replaying) return;
+    const maxMinute = availableEndMinute();
+    const progress = clamp((now - state.replayStartedAt) / Math.max(1, state.replayDurationMs), 0, 1);
+    const shouldDraw = !state.replayLastFrameAt || now - state.replayLastFrameAt >= 1000 / replayFrameRate() || progress >= 1;
+    if (shouldDraw) {
+      const minute = maxMinute * progress;
+      state.replayLastFrameAt = now;
+      state.replayLastMinute = minute;
+      setScrubMinuteFast(minute, true);
+      updateReplayControls();
+    }
+    if (progress >= 1) {
+      stopReplay(true);
+      return;
+    }
+    state.replayFrame = requestAnimationFrame(stepReplay);
+  }
+
+  function stopReplay(resetToCurrent = false) {
+    if (state.replayFrame) cancelAnimationFrame(state.replayFrame);
+    state.replayFrame = 0;
+    if (!state.replaying && !resetToCurrent) return;
+    state.replaying = false;
+    state.replayStartedAt = 0;
+    state.replayLastFrameAt = 0;
+    state.replayLastMinute = -1;
+    if (resetToCurrent) state.scrubMinute = null;
+    updateReplayControls();
+    if (resetToCurrent) renderAll();
   }
 
   function setScrubFromPointer(event) {
@@ -480,7 +1221,13 @@
 
   function rankSubText(item) {
     const source = item.sourceName && item.sourceName !== item.name ? `来源：${item.sourceName}` : (CATEGORY_LABELS[item.category] || item.category);
-    const suffix = item.pointSource === 'minute' ? ' · 分钟线' : '';
+    const suffix = item.pointSource === 'minute'
+      ? ' · 分钟线'
+      : item.pointSource === 'stored'
+        ? ' · 存档走势'
+        : item.pointSource === 'daily'
+          ? ' · 日资金'
+          : '';
     return escapeHtml(`${source}${suffix}`);
   }
 
@@ -543,29 +1290,54 @@
   }
 
   function drawChart() {
-    if (!state.data) return;
     const width = els.wrap.clientWidth;
     const height = els.wrap.clientHeight;
     if (!width || !height) return;
     ctx.clearRect(0, 0, width, height);
+    drawCanvasBackground(width, height);
+    if (!state.data) return;
 
     const series = currentSeries();
-    state.visibleSeries = series;
-    const timeline = state.data.timeline || tradingTimeline();
-    const plots = buildPlots(width, height, timeline);
-    state.plot = { plots, primary: plots[0], endMinute: timeline.elapsed };
-    plots.forEach(plotInfo => {
-      drawGrid(plotInfo.plot, plotInfo.scale, width, height, timeline, plotInfo);
-      drawPanelTitle(plotInfo);
-      drawLines(series, plotInfo.plot, plotInfo.scale, plotInfo.metric);
-      drawCurrentMarker(plotInfo.plot, timeline);
-    });
-    drawLabels(series, plots[0].plot, plots[0].scale, width, plots[0].metric);
-    drawEmptyState(plots[0].plot);
-    drawWatermark(plots[0].plot);
+    pointRowsFrameCache = new Map();
+    try {
+      state.visibleSeries = series;
+      const timeline = state.data.timeline || tradingTimeline();
+      const plots = buildPlots(width, height, timeline, series);
+      state.plot = { plots, primary: plots[0], endMinute: timeline.elapsed };
+      plots.forEach(plotInfo => {
+        drawGrid(plotInfo.plot, plotInfo.scale, width, height, timeline, plotInfo);
+        drawPanelTitle(plotInfo);
+        drawLines(series, plotInfo.plot, plotInfo.scale, plotInfo.metric);
+        drawCurrentMarker(plotInfo.plot, timeline);
+      });
+      drawLabels(series, plots[0].plot, plots[0].scale, width, plots[0].metric);
+      drawEmptyState(plots[0].plot);
+      drawWatermark(plots[0].plot);
+    } finally {
+      pointRowsFrameCache = null;
+    }
   }
 
-  function buildPlots(width, height, timeline) {
+  function drawCanvasBackground(width, height) {
+    ctx.save();
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, width, height);
+
+    const top = ctx.createLinearGradient(0, 0, 0, height);
+    top.addColorStop(0, 'rgba(201,59,59,0.055)');
+    top.addColorStop(0.47, 'rgba(255,255,255,0)');
+    ctx.fillStyle = top;
+    ctx.fillRect(0, 0, width, height);
+
+    const bottom = ctx.createLinearGradient(0, 0, 0, height);
+    bottom.addColorStop(0.51, 'rgba(255,255,255,0)');
+    bottom.addColorStop(1, 'rgba(24,114,71,0.065)');
+    ctx.fillStyle = bottom;
+    ctx.fillRect(0, 0, width, height);
+    ctx.restore();
+  }
+
+  function buildPlots(width, height, timeline, series = currentSeries()) {
     const compact = isCompactViewport();
     const labelReserve = state.chartMode === 'price'
       ? Math.min(compact ? 108 : 190, Math.max(compact ? 82 : 130, width * (compact ? 0.22 : 0.16)))
@@ -583,7 +1355,7 @@
         height: height - pad.top - pad.bottom,
         endMinute: chartAxisEndMinute()
       };
-      return [{ metric, title: metric === 'price' ? '板块分时涨跌幅' : '资金净流入', unit: metric === 'price' ? '%' : '亿', plot, pad, scale: computeScale(currentSeries(), metric), endMinute: timeline.elapsed }];
+      return [{ metric, title: metric === 'price' ? '板块分时涨跌幅' : '资金净流入', unit: metric === 'price' ? '%' : '亿', plot, pad, scale: computeScale(series, metric), endMinute: timeline.elapsed }];
     }
     const usableHeight = height - pad.top - pad.bottom - 20;
     const flowHeight = Math.max(compact ? 180 : 210, Math.round(usableHeight * (compact ? 0.58 : 0.62)));
@@ -591,8 +1363,8 @@
     const flowPlot = { x: pad.left, y: pad.top, width: plotWidth, height: flowHeight, endMinute: chartAxisEndMinute() };
     const pricePlot = { x: pad.left, y: flowPlot.y + flowPlot.height + 20, width: plotWidth, height: priceHeight, endMinute: chartAxisEndMinute() };
     return [
-      { metric: 'flow', title: '资金净流入', unit: '亿', plot: flowPlot, pad, scale: computeScale(currentSeries(), 'flow'), endMinute: timeline.elapsed },
-      { metric: 'price', title: '板块分时涨跌幅', unit: '%', plot: pricePlot, pad, scale: computeScale(currentSeries(), 'price'), endMinute: timeline.elapsed }
+      { metric: 'flow', title: '资金净流入', unit: '亿', plot: flowPlot, pad, scale: computeScale(series, 'flow'), endMinute: timeline.elapsed },
+      { metric: 'price', title: '板块分时涨跌幅', unit: '%', plot: pricePlot, pad, scale: computeScale(series, 'price'), endMinute: timeline.elapsed }
     ];
   }
 
@@ -744,9 +1516,7 @@
     const endMinute = clamp(Number(timeline?.elapsed) || 0, 0, TRADING_DAY_MINUTES);
     const endLabel = minuteToTimeLabel(endMinute);
     const byMinute = new Map();
-    const hasRealTimeline = metric === 'flow'
-      ? pointSource === 'minute'
-      : pointSource === 'minute';
+    const hasRealTimeline = isTimelineSource(pointSource, metric);
 
     if (metric === 'flow' && hasRealTimeline) byMinute.set(0, { time: '09:30', value: 0 });
     const normalizedPoints = hasRealTimeline ? points : latestOnlyPoints(points, latest, endMinute);
@@ -764,6 +1534,12 @@
     return [...byMinute.entries()]
       .sort((a, b) => a[0] - b[0])
       .map(([, point]) => point);
+  }
+
+  function isTimelineSource(source, metric = 'flow') {
+    if (source === 'minute') return true;
+    if (source === 'stored') return true;
+    return false;
   }
 
   function latestOnlyPoints(points, latest, endMinute) {
@@ -1018,7 +1794,9 @@
   }
 
   function pointRows(item, metric, maxMinute = availableEndMinute()) {
-    return currentPoints(item, metric)
+    const cacheKey = pointRowsFrameCache ? `${item.id}:${metric}:${Math.round(maxMinute * 100)}` : '';
+    if (cacheKey && pointRowsFrameCache.has(cacheKey)) return pointRowsFrameCache.get(cacheKey);
+    const rows = currentPoints(item, metric)
       .map(point => ({
         minute: timeToMinute(point.time),
         time: point.time,
@@ -1026,11 +1804,13 @@
       }))
       .filter(point => Number.isFinite(point.minute) && point.minute <= maxMinute)
       .sort((a, b) => a.minute - b.minute);
+    if (cacheKey) pointRowsFrameCache.set(cacheKey, rows);
+    return rows;
   }
 
   function hasTimelinePoints(item, metric) {
     const source = metric === 'price' ? item.pricePointSource : item.pointSource;
-    return source === 'minute' && currentPoints(item, metric).length > 1;
+    return isTimelineSource(source, metric) && currentPoints(item, metric).length > 1;
   }
 
   function hasDrawablePoints(item, metric) {
@@ -1123,10 +1903,61 @@
       els.hint.textContent = '已暂停自动请求，手动刷新仍可使用。';
       return;
     }
+    if (isHistoricalDate()) {
+      els.countdown.textContent = '历';
+      els.hint.textContent = `正在回溯 ${state.selectedDate}，历史日期不自动轮询；手动查询会重新请求。`;
+      return;
+    }
     const left = Math.max(0, Math.ceil((state.nextFetchAt - now) / 1000));
     els.countdown.textContent = String(left);
     els.hint.textContent = `上次更新：${state.data ? formatClock(new Date(state.data.updatedAt)) : '--'}；真实请求约 ${Math.round((state.data?.refreshAfterMs || REQUEST_INTERVAL_MS) / 1000)} 秒一次。`;
     fetchData(false);
+  }
+
+  function normalizeSelectedDate(value) {
+    const text = String(value || '').trim();
+    const match = text.match(/^\d{4}-\d{2}-\d{2}$/);
+    const today = todayDate();
+    if (!match) return today;
+    return text > today ? today : text;
+  }
+
+  function syncModeButtons() {
+    [...els.mode.querySelectorAll('button')].forEach(item => {
+      item.classList.toggle('active', item.dataset.mode === state.chartMode);
+    });
+  }
+
+  function setSelectedDate(value, force = true) {
+    const nextDate = normalizeSelectedDate(value);
+    const changed = nextDate !== state.selectedDate;
+    stopReplay(false);
+    state.selectedDate = nextDate;
+    state.scrubMinute = null;
+    state.hoverId = null;
+    state.lockedId = null;
+    state.nextFetchAt = 0;
+    updateDateControls();
+    if (!changed && !force) return;
+    applyData(createEmptyData(`正在查询 ${nextDate} 的真实资金和涨跌幅数据。`));
+    fetchData(true);
+    tick();
+  }
+
+  function openDatePicker() {
+    if (!els.dateInput) return;
+    if (state.focusPanelOpen) {
+      state.focusPanelOpen = false;
+      updateFocusManager();
+    }
+    toggleDateMenu();
+    els.dateInput.focus();
+  }
+
+  function toggleDateMenu(force) {
+    if (!els.dateMenu) return;
+    const shouldOpen = typeof force === 'boolean' ? force : els.dateMenu.hidden;
+    els.dateMenu.hidden = !shouldOpen;
   }
 
   function bindEvents() {
@@ -1147,6 +1978,61 @@
       els.pause.textContent = state.paused ? '恢复' : '暂停';
       tick();
     });
+    els.focusToggle?.addEventListener('click', () => {
+      toggleDateMenu(false);
+      state.focusPanelOpen = !state.focusPanelOpen;
+      if (state.focusPanelOpen) fetchFocusCandidates();
+      updateFocusManager();
+      if (state.focusPanelOpen) requestAnimationFrame(() => els.focusSearch?.focus());
+    });
+    els.focusReset?.addEventListener('click', resetFocusNames);
+    els.focusLimit?.addEventListener('click', toggleFocusUnlimited);
+    els.focusPanel?.addEventListener('click', event => {
+      event.stopPropagation();
+    });
+    els.focusSelectAll?.addEventListener('click', event => {
+      event.stopPropagation();
+      selectAllFocusNames().catch(err => {
+        if (!state.data) return;
+        state.data.sourceStatus = {
+          ...(state.data.sourceStatus || {}),
+          level: 'warn',
+          text: '全选失败',
+          detail: err?.message || '大类全选请求失败。'
+        };
+        renderAll();
+      });
+    });
+    els.focusSearch?.addEventListener('input', renderFocusCandidates);
+    els.focusCandidates?.addEventListener('click', event => {
+      event.stopPropagation();
+      const button = event.target.closest('[data-toggle-focus]');
+      if (!button || button.disabled) return;
+      toggleFocusName(button.dataset.toggleFocus).catch(err => {
+        if (!state.data) return;
+        state.data.sourceStatus = {
+          ...(state.data.sourceStatus || {}),
+          level: 'warn',
+          text: '选择失败',
+          detail: err?.message || '大类选择请求失败。'
+        };
+        renderAll();
+      });
+    });
+    els.dateInput?.addEventListener('change', () => {
+      setSelectedDate(els.dateInput.value);
+    });
+    els.datePicker?.addEventListener('click', openDatePicker);
+    els.dateMenu?.addEventListener('click', event => {
+      const button = event.target.closest('button[data-date]');
+      if (!button) return;
+      toggleDateMenu(false);
+      setSelectedDate(button.dataset.date);
+    });
+    els.dateToday?.addEventListener('click', () => {
+      toggleDateMenu(false);
+      setSelectedDate(todayDate());
+    });
     els.sort.addEventListener('change', () => {
       state.sortMode = els.sort.value;
       renderAll();
@@ -1156,6 +2042,7 @@
       setScrubMinute(els.timeRange.value);
     });
     els.timeRange?.addEventListener('pointerdown', event => {
+      stopReplay(false);
       state.scrubDragging = true;
       els.timeRange.setPointerCapture?.(event.pointerId);
       setScrubFromPointer(event);
@@ -1171,19 +2058,36 @@
       renderAll();
     });
     els.timeNow?.addEventListener('click', () => {
+      stopReplay(false);
       state.scrubMinute = null;
       renderAll();
+    });
+    els.replaySeconds?.addEventListener('change', () => {
+      const seconds = clamp(Number(els.replaySeconds.value) || 30, 10, 600);
+      state.replayDurationMs = seconds * 1000;
+      saveReplaySeconds(seconds);
+      updateReplayControls();
+    });
+    els.replayBtn?.addEventListener('click', () => {
+      if (state.replaying) stopReplay(true);
+      else startReplay(els.replaySeconds?.value);
+    });
+    els.recordBtn?.addEventListener('click', () => {
+      if (state.recording) stopCanvasRecording();
+      else startCanvasRecording();
     });
     els.mode.addEventListener('click', event => {
       const button = event.target.closest('button[data-mode]');
       if (!button) return;
+      stopReplay(false);
       state.chartMode = ['dual', 'flow', 'price'].includes(button.dataset.mode) ? button.dataset.mode : 'dual';
-      [...els.mode.querySelectorAll('button')].forEach(item => item.classList.toggle('active', item === button));
+      syncModeButtons();
       renderAll();
     });
     els.tabs.addEventListener('click', event => {
       const button = event.target.closest('button[data-scope]');
       if (!button) return;
+      stopReplay(false);
       state.selectedScope = button.dataset.scope;
       [...els.tabs.querySelectorAll('button')].forEach(item => item.classList.toggle('active', item === button));
       renderAll();
@@ -1209,22 +2113,41 @@
       drawChart();
     });
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) return;
+      if (document.hidden) {
+        stopReplay(false);
+        return;
+      }
       state.nextFetchAt = 0;
       fetchData(false);
       tick();
     });
+    document.addEventListener('click', event => {
+      if (!event.target.closest('.date-control')) toggleDateMenu(false);
+      if (event.target.closest('#focusPanel') || event.target.closest('#focusToggleBtn')) return;
+      if (!state.focusPanelOpen) return;
+      state.focusPanelOpen = false;
+      updateFocusManager();
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      toggleDateMenu(false);
+      if (!state.focusPanelOpen) return;
+      state.focusPanelOpen = false;
+      updateFocusManager();
+    });
   }
 
   function createEmptyData(reason) {
-    const timeline = tradingTimeline();
+    const timeline = isHistoricalDate() ? closedTradingTimeline() : tradingTimeline();
     return {
       updatedAt: new Date().toISOString(),
-      tradeDate: formatDate(new Date()),
+      tradeDate: state.selectedDate || todayDate(),
+      requestedDate: state.selectedDate || todayDate(),
       refreshAfterMs: REQUEST_INTERVAL_MS,
       sourceStatus: { level: 'error', text: '真实源不可用', detail: reason || '未取得真实资金流数据。' },
       timeline,
       series: [],
+      focusCandidates: [],
       leaders: { inflowTop: [], outflowTop: [] },
       breakdown: [],
       note: '未展示模拟走势。'
@@ -1254,7 +2177,7 @@
   }
 
   function minuteToTimeLabel(minutes) {
-    const clamped = clamp(minutes, 0, TRADING_DAY_MINUTES);
+    const clamped = Math.round(clamp(minutes, 0, TRADING_DAY_MINUTES));
     const morningMinutes = Math.min(clamped, 120);
     if (clamped <= 120) {
       const date = new Date(2026, 0, 1, 9, 30 + morningMinutes, 0);
@@ -1317,6 +2240,16 @@
     };
   }
 
+  function closedTradingTimeline() {
+    return {
+      elapsed: TRADING_DAY_MINUTES,
+      total: TRADING_DAY_MINUTES,
+      endLabel: '15:00',
+      session: 'closed',
+      isTradingTime: false
+    };
+  }
+
   function shanghaiTimeParts(date) {
     const parts = new Intl.DateTimeFormat('zh-CN', {
       timeZone: 'Asia/Shanghai',
@@ -1348,8 +2281,9 @@
     const localTimeline = tradingTimeline();
     const localElapsed = localTimeline.elapsed;
     const candidate = Number.isFinite(dataElapsed) ? dataElapsed : localElapsed;
-    const today = formatDate(new Date());
-    const sameTradeDate = !state.data?.tradeDate || state.data.tradeDate === today;
+    const today = todayDate();
+    const dataDate = state.data?.requestedDate || state.data?.tradeDate;
+    const sameTradeDate = !dataDate || dataDate === today;
     const bounded = sameTradeDate && localElapsed < candidate ? localElapsed : candidate;
     return clamp(bounded, 0, TRADING_DAY_MINUTES);
   }
@@ -1383,6 +2317,73 @@
     return Number(value.toFixed(2));
   }
 
+  function normalizeFocusName(value) {
+    return String(value || '')
+      .replace(/[<>]/g, '')
+      .replace(/\s+/g, '')
+      .trim()
+      .slice(0, 24);
+  }
+
+  function normalizeFocusNames(values, limit = FOCUS_LIMIT) {
+    const seen = new Set();
+    const normalized = (Array.isArray(values) ? values : [])
+      .map(normalizeFocusName)
+      .filter(Boolean)
+      .filter(name => {
+        const key = normalizeBoardName(name);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    return Number.isFinite(limit) ? normalized.slice(0, limit) : normalized;
+  }
+
+  function normalizeFocusCandidates(values) {
+    const seen = new Set();
+    return (Array.isArray(values) ? values : [])
+      .map(item => ({
+        name: normalizeFocusName(item.name),
+        category: item.category || 'concept',
+        sourceName: normalizeFocusName(item.sourceName),
+        sourceCategory: item.sourceCategory || '',
+        sourceCode: item.sourceCode || '',
+        latest: Number(item.latest) || 0,
+        changePct: Number(item.changePct) || 0
+      }))
+      .filter(item => item.name)
+      .filter(item => {
+        const key = normalizeBoardName(item.name);
+        if (!key || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
+  function sameFocusNames(a, b) {
+    const left = normalizeFocusNames(a, Infinity).map(normalizeBoardName);
+    const right = normalizeFocusNames(b, Infinity).map(normalizeBoardName);
+    return left.length === right.length && left.every((item, index) => item === right[index]);
+  }
+
+  function fuzzyIncludes(name, query) {
+    const source = normalizeBoardName(name).toLowerCase();
+    const target = normalizeBoardName(query).toLowerCase();
+    if (!target) return true;
+    if (source.includes(target)) return true;
+    let cursor = 0;
+    for (const char of target) {
+      const next = source.indexOf(char, cursor);
+      if (next === -1) return false;
+      cursor = next + char.length;
+    }
+    return true;
+  }
+
+  function normalizeBoardName(name) {
+    return String(name || '').replace(/[ⅠⅡⅢIV]+$/i, '').replace(/概念|行业|板块/g, '').trim();
+  }
+
   function clamp(value, min, max) {
     if (!Number.isFinite(value)) return min;
     return Math.max(min, Math.min(max, value));
@@ -1409,6 +2410,8 @@
   }
 
   bindEvents();
+  updateRecordControls();
+  fetchFocusCandidates();
   if (!loadCachedDataOnBoot()) applyData(createEmptyData('正在连接本地真实资金流接口。'));
   resizeCanvas();
   fetchData(true);
