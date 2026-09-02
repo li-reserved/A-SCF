@@ -5,7 +5,7 @@
 ## 1. 本地预览
 
 ```bash
-npm run fund-flow
+npm run dev
 ```
 
 打开：
@@ -17,8 +17,7 @@ http://127.0.0.1:5177/
 ## 2. 本地检查
 
 ```bash
-node --check public/app.js
-node --check scripts/fund-flow-proxy.mjs
+npm run check
 curl -fsS 'http://127.0.0.1:5177/api/fund-flow/overview?scope=all&limit=60'
 ```
 
@@ -29,7 +28,7 @@ curl -fsS 'http://127.0.0.1:5177/api/fund-flow/overview?scope=all&limit=60'
 - 日期选择、时间拖动和自动回溯播放正常。
 - Canvas 录制只包含图表画布，能开始/停止并下载视频。
 - 接口返回 `sourceStatus.text` 为 `真实数据`。
-- 默认 `series.length` 不超过 31；解除限制并传 `focusLimit=all` 时可以返回更多大类。
+- 默认 `series.length` 不超过 32；解除限制并传 `focusLimit=all` 时可以返回更多大类。
 - `/api/fund-flow/focus-groups` 能返回可选择的大类列表。
 
 ## 3. 上线到 Vercel
@@ -56,7 +55,7 @@ https://a-share-fund-flow-sepia.vercel.app
 ## 4. 上线后校验
 
 ```bash
-curl -fsS 'https://a-share-fund-flow-sepia.vercel.app/app.js' | rg 'setScrubMinuteFast|selectEvenLabels'
+curl -fsSI 'https://a-share-fund-flow-sepia.vercel.app/'
 
 curl -fsS 'https://a-share-fund-flow-sepia.vercel.app/api/fund-flow/overview?scope=all&limit=60'
 
