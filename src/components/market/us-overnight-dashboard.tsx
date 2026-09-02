@@ -104,6 +104,53 @@ function quoteActiveChange(changePct: number | null, extendedChangePct: number |
   return phase === "regular" ? changePct : extendedChangePct;
 }
 
+function alignTrendWithActiveQuote(
+  data: UsMarketTrendData,
+  stock: UsMarketQuote,
+  phase: UsMarketData["session"]["phase"],
+) {
+  const usesRegularQuote = phase === "regular";
+  const currentPrice = usesRegularQuote ? stock.latest : stock.extendedLatest;
+  const currentChange = usesRegularQuote ? stock.change : stock.extendedChange;
+  const currentChangePct = quoteActiveChange(stock.changePct, stock.extendedChangePct, phase);
+
+  if (currentPrice === null || currentChangePct === null) {
+    return { previousClose: data.previousClose, points: data.points };
+  }
+
+  const previousClose = currentChange !== null
+    ? currentPrice - currentChange
+    : currentChangePct !== -100
+      ? currentPrice / (1 + currentChangePct / 100)
+      : data.previousClose;
+  if (!Number.isFinite(previousClose) || previousClose === 0) {
+    return { previousClose: data.previousClose, points: data.points };
+  }
+
+  const points = data.points.map(point => ({
+    ...point,
+    changePct: (point.value / previousClose - 1) * 100,
+  }));
+  const lastPoint = points.at(-1);
+  if (lastPoint) {
+    points[points.length - 1] = {
+      ...lastPoint,
+      value: currentPrice,
+      changePct: currentChangePct,
+    };
+  }
+
+  return { previousClose, points };
+}
+
+function activeTrendLabels(phase: UsMarketData["session"]["phase"], fallback: string) {
+  if (phase === "overnight") return { session: "夜盘走势", baseline: "最近常规盘收盘" };
+  if (phase === "pre-market") return { session: "盘前走势", baseline: "最近常规盘收盘" };
+  if (phase === "regular") return { session: "常规盘走势", baseline: "上一常规盘收盘" };
+  if (phase === "after-hours") return { session: "盘后走势", baseline: "最近常规盘收盘" };
+  return { session: fallback, baseline: "最近常规盘收盘" };
+}
+
 function IndexStrip({ indexes }: { indexes: UsMarketIndex[] }) {
   return (
     <section className="grid overflow-hidden rounded-lg border bg-card shadow-sm sm:grid-cols-2 xl:grid-cols-4" aria-label="美股主要指数">
@@ -335,20 +382,28 @@ function MarketDirectionChart({ data }: { data: UsMarketData }) {
 
 function StockTrendPanel({
   stock,
+  phase,
   onClose,
 }: {
   stock: UsMarketQuote;
+  phase: UsMarketData["session"]["phase"];
   onClose: () => void;
 }) {
   const { data, error, loading, refreshing, reload } = useMarketData<UsMarketTrendData>(
     `/api/us-market/trend?symbol=${encodeURIComponent(stock.symbol)}`,
     30_000,
   );
-  const regularOpen = data?.points.find(point => point.phase === "regular")?.time;
-  const afterHoursOpen = data?.points.find(point => point.phase === "after-hours")?.time;
-  const firstTime = data?.points[0]?.time;
-  const lastTime = data?.points.at(-1)?.time;
-  const lastChangePct = data?.points.at(-1)?.changePct ?? null;
+  const alignedTrend = useMemo(
+    () => data ? alignTrendWithActiveQuote(data, stock, phase) : null,
+    [data, phase, stock],
+  );
+  const trendLabels = activeTrendLabels(phase, data?.sessionLabel ?? "当前交易时段走势");
+  const points = alignedTrend?.points ?? [];
+  const regularOpen = points.find(point => point.phase === "regular")?.time;
+  const afterHoursOpen = points.find(point => point.phase === "after-hours")?.time;
+  const firstTime = points[0]?.time;
+  const lastTime = points.at(-1)?.time;
+  const lastChangePct = points.at(-1)?.changePct ?? null;
   const lineColor = lastChangePct === null || lastChangePct === 0 ? "#4f46b8" : lastChangePct > 0 ? "#e11d48" : "#059669";
 
   return (
@@ -360,7 +415,7 @@ function StockTrendPanel({
             {refreshing && <LoaderCircle className="h-3 w-3 animate-spin text-muted-foreground" aria-label="正在更新走势" />}
           </div>
           <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
-            {data ? `${data.sessionLabel} · 相对${data.baselineLabel} $${formatNumber(data.previousClose)} · ${data.marketDate}` : "当前交易时段 · 北京时间"}
+            {data && alignedTrend ? `${trendLabels.session} · 相对${trendLabels.baseline} $${formatNumber(alignedTrend.previousClose)} · ${data.marketDate}` : "当前交易时段 · 北京时间"}
           </p>
         </div>
         <Button
@@ -391,10 +446,10 @@ function StockTrendPanel({
             </Button>
           </div>
         </div>
-      ) : data && data.points.length ? (
-        <div className="mt-2 h-[176px] w-full min-w-0" role="img" aria-label={`${stock.symbol} ${data.sessionLabel}`}>
+      ) : data && points.length ? (
+        <div className="mt-2 h-[176px] w-full min-w-0" role="img" aria-label={`${stock.symbol} ${trendLabels.session}，最新 ${formatPercent(lastChangePct)}`}>
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={data.points} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+            <LineChart data={points} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
               <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="hsl(var(--border))" />
               {firstTime && regularOpen && <ReferenceArea x1={firstTime} x2={regularOpen} fill="#d97706" fillOpacity={0.045} />}
               {afterHoursOpen && lastTime && <ReferenceArea x1={afterHoursOpen} x2={lastTime} fill="#0891b2" fillOpacity={0.045} />}
@@ -591,7 +646,7 @@ function ThemeBoard({ data }: { data: UsMarketData }) {
                 );
               })}
             </div>
-            {selectedStock && <StockTrendPanel stock={selectedStock} onClose={() => setSelectedSymbol(null)} />}
+            {selectedStock && <StockTrendPanel stock={selectedStock} phase={data.session.phase} onClose={() => setSelectedSymbol(null)} />}
           </div>
 
           <div className="mt-5 grid grid-cols-2 gap-4 border-t pt-5">

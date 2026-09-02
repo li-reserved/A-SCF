@@ -354,6 +354,17 @@ function chartPhase(label) {
   return 'after-hours';
 }
 
+function nasdaqTimestamp(value) {
+  const wallTime = new Date(Number(value));
+  if (!Number.isFinite(wallTime.getTime())) return Number(value);
+  const parts = {
+    year: wallTime.getUTCFullYear(),
+    month: wallTime.getUTCMonth() + 1,
+    day: wallTime.getUTCDate()
+  };
+  return zonedTimeToUtc(parts, wallTime.getUTCHours(), wallTime.getUTCMinutes());
+}
+
 async function loadNasdaqChart(symbol, assetClass) {
   const url = new URL(`https://api.nasdaq.com/api/quote/${symbol}/chart`);
   url.searchParams.set('assetclass', assetClass);
@@ -366,7 +377,7 @@ async function loadNasdaqChart(symbol, assetClass) {
   const points = data.chart
     .filter((_, index) => index % 5 === 0 || index === data.chart.length - 1)
     .map(point => ({
-      time: Number(point.x),
+      time: nasdaqTimestamp(point.x),
       value: Number(point.y),
       changePct: previousClose ? round((Number(point.y) / previousClose - 1) * 100, 3) : null,
       phase: chartPhase(point.z?.dateTime),
